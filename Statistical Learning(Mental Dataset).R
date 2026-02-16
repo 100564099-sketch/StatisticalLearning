@@ -5,6 +5,7 @@ library(caret)
 library(MASS)
 library(klaR)
 library(dplyr)
+library(e1071)
 
 # Load dataset
 mental = read.csv("mental_health.csv")
@@ -115,11 +116,29 @@ prop.table(table(mental_val$Has_Mental_Health_Issue))
 prop.table(table(mental_test$Has_Mental_Health_Issue))
 
 
+target_col <- "Has_Mental_Health_Issue"
+num_cols <- names(mental_train)[sapply(mental_train, is.numeric)]
+num_cols <- setdiff(num_cols, target_col)
+
+mu <- sapply(mental_train[, num_cols, drop = FALSE], mean)
+sd <- sapply(mental_train[, num_cols, drop = FALSE], sd)
+sd[sd == 0] <- 1
+
+scale_apply <- function(df, num_cols, mu, sd) {
+  out <- df
+  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
+  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
+  out
+}
+
+train_sc <- scale_apply(mental_train, num_cols, mu, sd)
+val_sc   <- scale_apply(mental_val,   num_cols, mu, sd)
+test_sc  <- scale_apply(mental_test,  num_cols, mu, sd)
+
 
 
 # setup 5-fold cross-validation with 3 repeats
-ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final")
-
+folds <- createMultiFolds(train_sc$Has_Mental_Health_Issue, k = 5, times = 3)
 
 # Train initial logreg, LDA, QDA and NB models
 # Since the dataset is imbalanced we avoid using accuracy and optimized based on ROC
@@ -128,6 +147,15 @@ fit_logreg <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "
 fit_lda <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "lda", metric = "ROC", trControl = ctrl)
 fit_qda <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "qda", metric = "ROC", trControl = ctrl)
 fit_nb <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "nb", metric = "ROC", trControl = ctrl, tuneLength = 10)
+
+
+# same columns across splits?
+stopifnot(identical(names(mental_train), names(mental_val)))
+stopifnot(identical(names(mental_train), names(mental_test)))
+
+# any weird non-atomic columns?
+stopifnot(all(sapply(mental_train, is.atomic)))
+
 
 models <- list(LogReg = fit_logreg, LDA = fit_lda, QDA = fit_qda, NB = fit_nb)
 
