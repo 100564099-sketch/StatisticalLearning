@@ -118,55 +118,16 @@ prop.table(table(mental_test$Has_Mental_Health_Issue))
 
 
 # setup 5-fold cross-validation with 3 repeats
-ctrl <- trainControl(
-  method = "repeatedcv",
-  number = 5,
-  repeats = 3,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,
-  savePredictions = "final"
-)
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final")
 
 
 # Train initial logreg, LDA, QDA and NB models
 # Since the dataset is imbalanced we avoid using accuracy and optimized based on ROC
 set.seed(42)
-fit_logreg <- train(
-  Has_Mental_Health_Issue ~ .,
-  data = mental_train,
-  method = "glm",
-  family = binomial(),
-  metric = "ROC",
-  trControl = ctrl
-)
-
-set.seed(42)
-fit_lda <- train(
-  Has_Mental_Health_Issue ~ .,
-  data = mental_train,
-  method = "lda",
-  metric = "ROC",
-  trControl = ctrl
-)
-
-set.seed(42)
-fit_qda <- train(
-  Has_Mental_Health_Issue ~ .,
-  data = mental_train,
-  method = "qda",
-  metric = "ROC",
-  trControl = ctrl
-)
-
-set.seed(42)
-fit_nb <- train(
-  Has_Mental_Health_Issue ~ .,
-  data = mental_train,
-  method = "nb",
-  metric = "ROC",
-  trControl = ctrl,
-  tuneLength = 10
-)
+fit_logreg <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "glm", family = binomial(), metric = "ROC", trControl = ctrl)
+fit_lda <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "lda", metric = "ROC", trControl = ctrl)
+fit_qda <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "qda", metric = "ROC", trControl = ctrl)
+fit_nb <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "nb", metric = "ROC", trControl = ctrl, tuneLength = 10)
 
 models <- list(LogReg = fit_logreg, LDA = fit_lda, QDA = fit_qda, NB = fit_nb)
 
