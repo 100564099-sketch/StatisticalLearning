@@ -3,7 +3,6 @@ setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
 # Libraries
 library(caret)
 library(MASS)
-library(klaR)
 library(dplyr)
 library(e1071)
 
@@ -139,26 +138,33 @@ test_sc  <- scale_apply(mental_test,  num_cols, mu, sd)
 
 # setup 5-fold cross-validation with 3 repeats
 folds <- createMultiFolds(train_sc$Has_Mental_Health_Issue, k = 5, times = 3)
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, index = folds, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final")
 
-# Train initial logreg, LDA, QDA and NB models
-# Since the dataset is imbalanced we avoid using accuracy and optimized based on ROC
+
 set.seed(42)
-fit_logreg <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "glm", family = binomial(), metric = "ROC", trControl = ctrl)
-fit_lda <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "lda", metric = "ROC", trControl = ctrl)
-fit_qda <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "qda", metric = "ROC", trControl = ctrl)
-fit_nb <- train(Has_Mental_Health_Issue ~ ., data = mental_train, method = "nb", metric = "ROC", trControl = ctrl, tuneLength = 10)
+
+# logreg, LDA, QDA cross-validation as initial models
+fit_logreg <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="glm", family=binomial(), metric="ROC", trControl=ctrl)
+fit_lda    <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="lda", metric="ROC", trControl=ctrl)
+fit_qda    <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="qda", metric="ROC", trControl=ctrl)
+
+# Naive Bayes with same CV format
+y    <- train_sc$Has_Mental_Health_Issue
+p_nb <- rep(NA_real_, nrow(train_sc))
+
+# Calculate AUC score for Naive bayes
+for (nm in names(folds)) {
+  idx_in  <- folds[[nm]]
+  idx_out <- setdiff(seq_len(nrow(train_sc)), idx_in)
+  
+  nb_fit <- naiveBayes(Has_Mental_Health_Issue ~ ., data=train_sc[idx_in, ])
+  p <- predict(nb_fit, newdata=train_sc[idx_out, ], type="raw")[, "Yes"]
+  
+  p_nb[idx_out] <- ifelse(is.na(p_nb[idx_out]), p, (p_nb[idx_out] + p) / 2)
+}
+
+auc_nb <- as.numeric(pROC::auc(pROC::roc(y, p_nb, levels=c("No","Yes"), direction="<", quiet=TRUE)))
 
 
-# same columns across splits?
-stopifnot(identical(names(mental_train), names(mental_val)))
-stopifnot(identical(names(mental_train), names(mental_test)))
-
-# any weird non-atomic columns?
-stopifnot(all(sapply(mental_train, is.atomic)))
-
-
-models <- list(LogReg = fit_logreg, LDA = fit_lda, QDA = fit_qda, NB = fit_nb)
-
-# (optional) CV ROC summary
-sapply(models, function(m) max(m$results$ROC))
-
+# CV ROC summary
+c(LogReg=max(fit_logreg$results$ROC), LDA=max(fit_lda$results$ROC), QDA=max(fit_qda$results$ROC), NB=auc_nb)
