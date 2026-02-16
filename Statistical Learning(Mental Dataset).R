@@ -1,4 +1,4 @@
-setwd("/Users/utkusizanli/Desktop/UC3M/Statistical Learning/Midterm1")
+setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
 
 # Load dataset
 mental = read.csv("mental_health.csv")
@@ -7,8 +7,8 @@ mental = read.csv("mental_health.csv")
 dim(mental)     # number of rows and columns
 str(mental)     # variable types
 
-# Convert target variable to factor (classification task)
-mental$Has_Mental_Health_Issue = as.factor(mental$Has_Mental_Health_Issue)
+# Convert target variable to factor (classification task) and force "1" to be the first level (positive class)
+mental$Has_Mental_Health_Issue <- factor(mental$Has_Mental_Health_Issue, levels = c("1","0"))
 
 # Convert all character columns to factors automatically
 mental[] = lapply(mental, function(x) if (is.character(x)) as.factor(x) else x)
@@ -89,3 +89,4 @@ lapply(top_vars, function(v) {
 
 # SOME CHANGES
 
+mental
