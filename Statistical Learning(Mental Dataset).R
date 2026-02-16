@@ -1,5 +1,8 @@
 setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
 
+# Libraries
+library(caret)
+
 # Load dataset
 mental = read.csv("mental_health.csv")
 
@@ -10,8 +13,9 @@ str(mental)     # variable types
 # Convert target variable to factor (classification task) and force "1" to be the first level (positive class)
 mental$Has_Mental_Health_Issue <- factor(mental$Has_Mental_Health_Issue, levels = c("1","0"))
 
-# Convert all character columns to factors automatically
-mental[] = lapply(mental, function(x) if (is.character(x)) as.factor(x) else x)
+# Convert all character columns to factors automatically, excluding target because we already adjusted it
+mental[names(mental) != "Has_Mental_Health_Issue"] = lapply(mental[names(mental) != "Has_Mental_Health_Issue"], function(x) if (is.character(x)) as.factor(x) else x)
+
 
 # Check for missing values
 colSums(is.na(mental))   # No missing values 
@@ -60,8 +64,8 @@ sort(pvals)
 
 # Compute mean difference between classes 
 mean_diff = sapply(mental[sapply(mental, is.numeric)], function(x) {
-  abs(mean(x[mental$Has_Mental_Health_Issue==1]) -
-        mean(x[mental$Has_Mental_Health_Issue==0]))
+  abs(mean(x[mental$Has_Mental_Health_Issue=="1"]) -
+        mean(x[mental$Has_Mental_Health_Issue=="0"]))
 })
 
 sort(mean_diff, decreasing=TRUE)   
@@ -87,6 +91,20 @@ lapply(top_vars, function(v) {
 
 
 
-# SOME CHANGES
+# 60% Train - 20% Validation - 20% Test split
+set.seed(42)
 
-mental
+# 60% TRAIN, 20% VAL, 20% TEST (all stratified by the target)
+idx_train <- createDataPartition(mental$Has_Mental_Health_Issue, p = 0.60, list = FALSE)
+mental_train <- mental[idx_train, ]
+mental_tmp   <- mental[-idx_train, ]
+
+idx_val <- createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)  # half of remaining
+mental_val  <- mental_tmp[idx_val, ]
+mental_test <- mental_tmp[-idx_val, ]
+
+# checks (proportions should match closely)
+prop.table(table(mental$Has_Mental_Health_Issue))
+prop.table(table(mental_train$Has_Mental_Health_Issue))
+prop.table(table(mental_val$Has_Mental_Health_Issue))
+prop.table(table(mental_test$Has_Mental_Health_Issue))
