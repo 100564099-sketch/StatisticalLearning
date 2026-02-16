@@ -13,11 +13,12 @@ mental = read.csv("mental_health.csv")
 dim(mental)     # number of rows and columns
 str(mental)     # variable types
 
-# Convert target variable to factor (classification task) and force "1" to be the first level (positive class)
-mental$Has_Mental_Health_Issue <- factor(mental$Has_Mental_Health_Issue, levels = c("1","0"))
+# Convert all character columns to factors automatically
+char_cols <- names(mental)[sapply(mental, is.character)]
+mental[char_cols] <- lapply(mental[char_cols], as.factor)
 
-# Convert all character columns to factors automatically, excluding target because we already adjusted it
-mental[names(mental) != "Has_Mental_Health_Issue"] = lapply(mental[names(mental) != "Has_Mental_Health_Issue"], function(x) if (is.character(x)) as.factor(x) else x)
+# Convert target to factor, 1 = Yes (positive), 0 = No
+mental$Has_Mental_Health_Issue <- factor(ifelse(mental$Has_Mental_Health_Issue == 1, "Yes", "No"), levels = c("Yes", "No"))
 
 
 # Check for missing values
@@ -67,8 +68,8 @@ sort(pvals)
 
 # Compute mean difference between classes 
 mean_diff = sapply(mental[sapply(mental, is.numeric)], function(x) {
-  abs(mean(x[mental$Has_Mental_Health_Issue=="1"]) -
-        mean(x[mental$Has_Mental_Health_Issue=="0"]))
+  abs(mean(x[mental$Has_Mental_Health_Issue=="Yes"]) -
+        mean(x[mental$Has_Mental_Health_Issue=="No"]))
 })
 
 sort(mean_diff, decreasing=TRUE)   
@@ -112,4 +113,63 @@ prop.table(table(mental$Has_Mental_Health_Issue))
 prop.table(table(mental_train$Has_Mental_Health_Issue))
 prop.table(table(mental_val$Has_Mental_Health_Issue))
 prop.table(table(mental_test$Has_Mental_Health_Issue))
+
+
+
+
+# setup 5-fold cross-validation with 3 repeats
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+
+# Train initial logreg, LDA, QDA and NB models
+# Since the dataset is imbalanced we avoid using accuracy and optimized based on ROC
+set.seed(42)
+fit_logreg <- train(
+  Has_Mental_Health_Issue ~ .,
+  data = mental_train,
+  method = "glm",
+  family = binomial(),
+  metric = "ROC",
+  trControl = ctrl
+)
+
+set.seed(42)
+fit_lda <- train(
+  Has_Mental_Health_Issue ~ .,
+  data = mental_train,
+  method = "lda",
+  metric = "ROC",
+  trControl = ctrl
+)
+
+set.seed(42)
+fit_qda <- train(
+  Has_Mental_Health_Issue ~ .,
+  data = mental_train,
+  method = "qda",
+  metric = "ROC",
+  trControl = ctrl
+)
+
+set.seed(42)
+fit_nb <- train(
+  Has_Mental_Health_Issue ~ .,
+  data = mental_train,
+  method = "nb",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 10
+)
+
+models <- list(LogReg = fit_logreg, LDA = fit_lda, QDA = fit_qda, NB = fit_nb)
+
+# (optional) CV ROC summary
+sapply(models, function(m) max(m$results$ROC))
 
