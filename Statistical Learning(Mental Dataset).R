@@ -5,6 +5,7 @@ library(caret)
 library(MASS)
 library(dplyr)
 library(e1071)
+library(pROC)
 
 # Load dataset
 mental = read.csv("mental_health.csv")
@@ -149,22 +150,26 @@ fit_lda    <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="lda", me
 fit_qda    <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="qda", metric="ROC", trControl=ctrl)
 
 # Naive Bayes with same CV format
-y    <- train_sc$Has_Mental_Health_Issue
-p_nb <- rep(NA_real_, nrow(train_sc))
+auc_each <- numeric(length(folds))
+i <- 0
 
-# Calculate AUC score for Naive bayes
 for (nm in names(folds)) {
+  i <- i + 1
   idx_in  <- folds[[nm]]
   idx_out <- setdiff(seq_len(nrow(train_sc)), idx_in)
   
-  nb_fit <- naiveBayes(Has_Mental_Health_Issue ~ ., data=train_sc[idx_in, ])
-  p <- predict(nb_fit, newdata=train_sc[idx_out, ], type="raw")[, "Yes"]
+  nb_fit <- naiveBayes(Has_Mental_Health_Issue ~ ., data = train_sc[idx_in, ])
+  p_out  <- predict(nb_fit, newdata = train_sc[idx_out, ], type = "raw")[, "Yes"]
   
-  p_nb[idx_out] <- ifelse(is.na(p_nb[idx_out]), p, (p_nb[idx_out] + p) / 2)
+  roc_i <- roc(train_sc$Has_Mental_Health_Issue[idx_out], p_out,
+               levels = c("No","Yes"), direction = "<", quiet = TRUE)
+  auc_each[i] <- as.numeric(auc(roc_i))
 }
 
-auc_nb <- as.numeric(pROC::auc(pROC::roc(y, p_nb, levels=c("No","Yes"), direction="<", quiet=TRUE)))
+auc_nb <- mean(auc_each, na.rm = TRUE)
 
 
 # CV ROC summary
 c(LogReg=max(fit_logreg$results$ROC), LDA=max(fit_lda$results$ROC), QDA=max(fit_qda$results$ROC), NB=auc_nb)
+
+
