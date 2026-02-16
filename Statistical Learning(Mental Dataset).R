@@ -2,6 +2,9 @@ setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
 
 # Libraries
 library(caret)
+library(MASS)
+library(klaR)
+library(dplyr)
 
 # Load dataset
 mental = read.csv("mental_health.csv")
@@ -91,7 +94,7 @@ lapply(top_vars, function(v) {
 
 
 
-# 60% Train - 20% Validation - 20% Test split
+# 60% Train - 20% Validation - 20% Test split via stratified sampling
 set.seed(42)
 
 # 60% TRAIN, 20% VAL, 20% TEST (all stratified by the target)
@@ -99,12 +102,14 @@ idx_train <- createDataPartition(mental$Has_Mental_Health_Issue, p = 0.60, list 
 mental_train <- mental[idx_train, ]
 mental_tmp   <- mental[-idx_train, ]
 
-idx_val <- createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)  # half of remaining
+# half of remaining
+idx_val <- createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)
 mental_val  <- mental_tmp[idx_val, ]
 mental_test <- mental_tmp[-idx_val, ]
 
-# checks (proportions should match closely)
+# check proportions to confirm stratifications
 prop.table(table(mental$Has_Mental_Health_Issue))
 prop.table(table(mental_train$Has_Mental_Health_Issue))
 prop.table(table(mental_val$Has_Mental_Health_Issue))
 prop.table(table(mental_test$Has_Mental_Health_Issue))
+
