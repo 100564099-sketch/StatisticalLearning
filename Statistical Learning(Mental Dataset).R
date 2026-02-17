@@ -308,3 +308,5 @@ legend <- patchwork::wrap_elements(ggplotGrob(legend_plot + theme(legend.positio
 
 # 1 = Yes Majority causes problems when selecting thresholds
 # either find a metric that takes 0 into account or make No = 1 and Yes = 0
+
+#Martin was here
