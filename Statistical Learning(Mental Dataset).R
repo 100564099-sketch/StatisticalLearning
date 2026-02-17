@@ -309,4 +309,37 @@ legend <- patchwork::wrap_elements(ggplotGrob(legend_plot + theme(legend.positio
 # 1 = Yes Majority causes problems when selecting thresholds
 # either find a metric that takes 0 into account or make No = 1 and Yes = 0
 
-#Martin was here
+#We will calculate the probabilities on the TEST set
+p_logreg_test <- predict(fit_logreg, newdata = test_sc, type = "prob")[, "Yes"]
+p_lda_test    <- predict(fit_lda,    newdata = test_sc, type = "prob")[, "Yes"]
+p_qda_test    <- predict(fit_qda,    newdata = test_sc, type = "prob")[, "Yes"]
+p_nb_test     <- predict(nb_train, newdata = test_sc, type = "raw")[, "Yes"]
+
+#We will evaluate the model using the BEST thresholds that we find on the validation.
+evaluate_test <- function(y_true, prob, threshold, model_name){
+  pred_label <- factor(ifelse(prob >= threshold, "Yes", "No"), levels = c("Yes", "No"))
+  cm <- caret::confusionMatrix(pred_label, y_true, positive = "Yes")
+  
+#Extract the metrics
+  data.frame(
+    Model = model_name,
+    Test_Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Test_Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Test_Specificity = as.numeric(cm$byClass["Specificity"]),
+    Test_F1 = as.numeric(cm$byClass["F1"]),
+    Test_Precision = as.numeric(cm$byClass["Pos Pred Value"]),
+    Threshold_Used = threshold
+  )
+}
+
+#Run the evaluation for each model
+Final_Results <- dplyr:: bind_rows(
+  evaluate_test(test_sc$Has_Mental_Health_Issue, p_logreg_test, thr_logreg, "LogReg"),
+  evaluate_test(test_sc$Has_Mental_Health_Issue, p_lda_test,    thr_lda,    "LDA"),
+  evaluate_test(test_sc$Has_Mental_Health_Issue, p_qda_test,    thr_qda,    "QDA"),
+  evaluate_test(test_sc$Has_Mental_Health_Issue, p_nb_test,     thr_nb,     "Naive Bayes")
+)
+
+# Print final results
+print(Final_Results)
+
