@@ -175,11 +175,11 @@ prop.table(table(train_smote$Has_Mental_Health_Issue))
 
 
 target_col <- "Has_Mental_Health_Issue"
-num_cols <- names(mental_train)[sapply(mental_train, is.numeric)]
+num_cols <- names(train_smote)[sapply(train_smote, is.numeric)]
 num_cols <- setdiff(num_cols, target_col)
 
-mu <- sapply(mental_train[, num_cols, drop = FALSE], mean)
-sd <- sapply(mental_train[, num_cols, drop = FALSE], sd)
+mu <- sapply(train_smote[, num_cols, drop = FALSE], mean)
+sd <- sapply(train_smote[, num_cols, drop = FALSE], sd)
 sd[sd == 0] <- 1
 
 scale_apply <- function(df, num_cols, mu, sd) {
@@ -189,7 +189,7 @@ scale_apply <- function(df, num_cols, mu, sd) {
   out
 }
 
-train_sc <- scale_apply(mental_train, num_cols, mu, sd)
+train_sc <- scale_apply(train_smote, num_cols, mu, sd)
 val_sc   <- scale_apply(mental_val,   num_cols, mu, sd)
 test_sc  <- scale_apply(mental_test,  num_cols, mu, sd)
 
