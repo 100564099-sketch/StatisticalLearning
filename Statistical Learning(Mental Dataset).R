@@ -9,6 +9,7 @@ library(pROC)
 library(ggplot2)
 library(tidyr)
 library(patchwork)
+library(DMwR)
 
 
 # Load dataset
@@ -160,11 +161,13 @@ prop.table(table(mental_test$Has_Mental_Health_Issue))
 
 
 # SMOTE to reduce imbalance
-# === CODE to HERE ===
-# ====================
+train_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = mental_train,
+                     perc.over = 600, perc.under = 100)
 
+table(train_smote$Has_Mental_Health_Issue)
 
-
+prop.table(table(mental_train$Has_Mental_Health_Issue))
+prop.table(table(train_smote$Has_Mental_Health_Issue))
 
 
 
