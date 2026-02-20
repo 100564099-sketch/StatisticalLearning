@@ -158,6 +158,19 @@ prop.table(table(mental_val$Has_Mental_Health_Issue))
 prop.table(table(mental_test$Has_Mental_Health_Issue))
 
 
+
+# SMOTE to reduce imbalance
+# === CODE to HERE ===
+# ====================
+
+
+
+
+
+
+
+
+
 target_col <- "Has_Mental_Health_Issue"
 num_cols <- names(mental_train)[sapply(mental_train, is.numeric)]
 num_cols <- setdiff(num_cols, target_col)
