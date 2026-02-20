@@ -22,8 +22,15 @@ str(mental)     # variable types
 
 # 2. Data Preparation
 # Convert target variable to factor (classification task)
-mental$Has_Mental_Health_Issue = as.factor(mental$Has_Mental_Health_Issue)
+#mental$Has_Mental_Health_Issue = as.factor(mental$Has_Mental_Health_Issue)
 
+mental$Has_Mental_Health_Issue <- factor(
+  mental$Has_Mental_Health_Issue,
+  levels = c("0", "1"),
+  labels = c("No", "Yes")
+)
+# quick check
+levels(mental$Has_Mental_Health_Issue)
 # Convert all character columns to factors automatically
 mental[] = lapply(mental, function(x) if (is.character(x)) as.factor(x) else x)
 
@@ -164,12 +171,15 @@ prop.table(table(mental_test$Has_Mental_Health_Issue))
 train_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = mental_train,
                      perc.over = 600, perc.under = 100)
 
+train_smote$Has_Mental_Health_Issue <- factor(
+  train_smote$Has_Mental_Health_Issue,
+  levels = c("No", "Yes")
+)
+
 table(train_smote$Has_Mental_Health_Issue)
 
 prop.table(table(mental_train$Has_Mental_Health_Issue))
 prop.table(table(train_smote$Has_Mental_Health_Issue))
-
-
 
 
 
@@ -200,11 +210,14 @@ folds <- createMultiFolds(train_sc$Has_Mental_Health_Issue, k = 5, times = 3)
 ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, index = folds, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final")
 
 
-set.seed(42)
+
 
 # logreg, LDA, QDA cross-validation as initial models
+set.seed(42)
 fit_logreg <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="glm", family=binomial(), metric="ROC", trControl=ctrl)
+set.seed(42)
 fit_lda    <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="lda", metric="ROC", trControl=ctrl)
+set.seed(42)
 fit_qda    <- train(Has_Mental_Health_Issue ~ ., data=train_sc, method="qda", metric="ROC", trControl=ctrl)
 
 # Naive Bayes with same CV format
