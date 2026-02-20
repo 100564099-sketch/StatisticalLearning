@@ -18,13 +18,13 @@ mental = read.csv("mental_health.csv")
 dim(mental)     # number of rows and columns
 str(mental)     # variable types
 
+
+# 2. Data Preparation
+# Convert target variable to factor (classification task)
+mental$Has_Mental_Health_Issue = as.factor(mental$Has_Mental_Health_Issue)
+
 # Convert all character columns to factors automatically
-char_cols <- names(mental)[sapply(mental, is.character)]
-mental[char_cols] <- lapply(mental[char_cols], as.factor)
-
-# Convert target to factor, 1 = Yes (positive), 0 = No
-mental$Has_Mental_Health_Issue <- factor(ifelse(mental$Has_Mental_Health_Issue == 1, "Yes", "No"), levels = c("Yes", "No"))
-
+mental[] = lapply(mental, function(x) if (is.character(x)) as.factor(x) else x)
 
 # Check for missing values
 colSums(is.na(mental))   # No missing values 
@@ -33,71 +33,109 @@ colSums(is.na(mental))   # No missing values
 str(mental)
 summary(mental)
 
-# Check target distribution 
+# 3. target distribution 
 table(mental$Has_Mental_Health_Issue)
 prop.table(table(mental$Has_Mental_Health_Issue))
 
 # Notes: The target variable is highly imbalanced, with 7.84% of observations in class 0 and 92.16% in class 1. 
-# This imbalance may affect classification performance, since models could favor the majority class.
+
+# Visualize
+ggplot(mental, aes(x = Screen_Time_Hours_Day,
+                   y = Sleep_Hours_Night,
+                   color = Has_Mental_Health_Issue)) +
+  geom_point(alpha = 0.35, size = 1.6) +
+  labs(title = "Imbalanced Dataset: Mental Health",
+       subtitle = "Only 7.8% of observations are class 0",
+       x = "Screen Time (hours/day)",
+       y = "Sleep (hours/night)",
+       color = "Class") +
+  theme_minimal()
+
+# 4. EDA - Categorical Variables
 
 # Select categorical variables (exclude target)
-cat_vars = setdiff(names(mental)[sapply(mental, is.factor)], "Has_Mental_Health_Issue")
+cat_vars <- setdiff(names(mental)[sapply(mental, is.factor)],
+                    "Has_Mental_Health_Issue")
 
-# Measure strength of association using chi-square statistic
-chi_strength = sapply(cat_vars, function(v) {
-  as.numeric(chisq.test(table(mental[[v]], mental$Has_Mental_Health_Issue))$statistic)
+par(mfrow=c(3,3))
+
+lapply(cat_vars, function(v) {
+  
+  # Calculate class proportions per category
+  tab <- prop.table(table(mental[[v]],
+                          mental$Has_Mental_Health_Issue),1)
+  
+  barplot(tab,
+          col=c("lightblue","pink"),
+          main=paste("Class Proportions by", v),
+          ylab="Proportion")
 })
 
-# Select top 6 categorical variables
-top_vars_cat = names(sort(chi_strength, decreasing = TRUE))[1:6]
 
-# Plot barplots for selected categorical variables
-par(mfrow = c(2,3))
 
-lapply(top_vars_cat, function(v) {
-  tab = prop.table(table(mental[[v]], mental$Has_Mental_Health_Issue), 1)
+# 5. EDA - Numeric Variables 
+num_vars <- names(mental)[sapply(mental, is.numeric)]
+
+# Separate numeric variables by type
+binary_vars <- num_vars[sapply(mental[num_vars], function(x)
+  length(unique(x)) == 2)]
+
+discrete_vars <- num_vars[sapply(mental[num_vars], function(x)
+  length(unique(x)) > 2 & length(unique(x)) <= 15)]
+
+continuous_vars <- num_vars[sapply(mental[num_vars], function(x)
+  length(unique(x)) > 15)]
+
+# Binary numeric variables
+
+par(mfrow=c(3,3))
+
+lapply(binary_vars, function(v) {
+  
+  tab <- prop.table(table(mental[[v]], mental$Has_Mental_Health_Issue),1)
   
   barplot(t(tab),
-          beside = TRUE,
-          main = v,
-          legend.text = TRUE,
-          xlab = "Category",
-          ylab = "Proportion")
+          legend = TRUE,
+          beside=TRUE,
+          main=paste("Class Proportions by", v),
+          col=c("lightblue","pink"))
 })
+# Discrete variables (0-10 scales)
+par(mfrow=c(3,3))
 
-# Screen numeric predictors using t-tests
-pvals = sapply(mental[sapply(mental, is.numeric)],
-               function(x) t.test(x ~ mental$Has_Mental_Health_Issue)$p.value)
-
-sort(pvals)   
-
-# Compute mean difference between classes 
-mean_diff = sapply(mental[sapply(mental, is.numeric)], function(x) {
-  abs(mean(x[mental$Has_Mental_Health_Issue=="Yes"]) -
-        mean(x[mental$Has_Mental_Health_Issue=="No"]))
-})
-
-sort(mean_diff, decreasing=TRUE)   
-
-# Select top numeric predictors
-top_vars = names(sort(mean_diff, decreasing=TRUE)[1:6])
-
-# Plot boxplots for selected numeric predictors
-par(mfrow=c(2,3))
-
-lapply(top_vars, function(v) {
+lapply(discrete_vars, function(v) {
+  
   boxplot(mental[[v]] ~ mental$Has_Mental_Health_Issue,
-          main=v)
+          main=paste("Distribution of", v, "by Class"),
+          xlab="Mental Health Issue",
+          ylab=v)
 })
 
-#EDA
+# Continuous variables (density)
 
-# Demographic categorical variables (like gender, country, marital status) do not seem to strongly separate people with and without mental health issues.
+mental_long <- mental %>%
+  select(all_of(continuous_vars), Has_Mental_Health_Issue) %>%
+  pivot_longer(-Has_Mental_Health_Issue,
+               names_to="Variable",
+               values_to="Value")
 
-# Psychological and stress-related numeric variables show clear differences between the two groups.
+ggplot(mental_long,
+       aes(x=Value, fill=Has_Mental_Health_Issue)) +
+  geom_density(alpha=0.4) +
+  facet_wrap(~Variable, scales="free") +
+  theme_minimal() +
+  labs(title="Distribution of Continuous Variables by Mental Health Class")
 
-# Variables such as Work_Stress_Level, Feeling_Sad_Down, Financial_Stress, and Anxious_Nervous look like strong predictors of mental health issues.
 
+# EDA conclusion
+
+# Demographic categorical variables (Gender, Country, Marital_Status)
+# do not clearly separate the two classes.
+
+# Psychological and stress-related numeric variables show clearer differences.
+
+# Variables like Work_Stress_Level, Feeling_Sad_Down,
+# Financial_Stress, and Anxious_Nervous look like strong predictors.
 
 
 # 60% Train - 20% Validation - 20% Test split via stratified sampling
