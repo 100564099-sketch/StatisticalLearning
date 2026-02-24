@@ -1,4 +1,4 @@
-#setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
+setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
 
 # Libraries
 library(caret)
@@ -250,23 +250,26 @@ c(LogReg=max(fit_logreg$results$ROC), LDA=max(fit_lda$results$ROC), QDA=max(fit_
 # Threshold Selection
 thr_grid <- seq(0.05, 0.95, by = 0.01)
 
-calc_metrics <- function(y_true, prob_yes, thr) {
-  pred <- factor(ifelse(prob_yes >= thr, "Yes", "No"), levels = c("Yes","No"))
+calc_metrics_bal <- function(y_true, prob_yes, thr) {
+  pred <- factor(ifelse(prob_yes >= thr, "Yes", "No"), levels = c("No","Yes"))
   cm <- caret::confusionMatrix(pred, y_true, positive = "Yes")
   
   acc  <- as.numeric(cm$overall["Accuracy"])
-  prec <- as.numeric(cm$byClass["Pos Pred Value"])
   sens <- as.numeric(cm$byClass["Sensitivity"])
   spec <- as.numeric(cm$byClass["Specificity"])
+  bal  <- 0.5 * (sens + spec)
+  
+  prec <- as.numeric(cm$byClass["Pos Pred Value"])
   f1   <- if (is.na(prec) || is.na(sens) || (prec + sens) == 0) NA_real_ else 2 * prec * sens / (prec + sens)
   
   data.frame(threshold = thr, Accuracy = acc, Precision = prec,
-             Sensitivity = sens, Specificity = spec, F1 = f1)
+             Sensitivity = sens, Specificity = spec, BalancedAcc = bal, F1 = f1)
 }
 
-pick_best_thr <- function(y_true, prob_yes) {
-  tbl <- dplyr::bind_rows(lapply(thr_grid, function(t) calc_metrics(y_true, prob_yes, t))) |>
-    dplyr::arrange(dplyr::desc(F1), dplyr::desc(Sensitivity), dplyr::desc(Accuracy))
+# 3) threshold picker
+pick_best_thr_bal <- function(y_true, prob_yes) {
+  tbl <- dplyr::bind_rows(lapply(thr_grid, function(t) calc_metrics_bal(y_true, prob_yes, t))) |>
+    dplyr::arrange(dplyr::desc(BalancedAcc), dplyr::desc(Sensitivity), dplyr::desc(Specificity))
   list(best = tbl[1, ], all = tbl)
 }
 
@@ -279,24 +282,25 @@ nb_train <- e1071::naiveBayes(Has_Mental_Health_Issue ~ ., data = train_sc)
 p_nb     <- predict(nb_train, newdata = val_sc, type = "raw")[, "Yes"]
 
 # --- pick best threshold per model (by F1)
-best_logreg <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_logreg)$best; best_logreg$Model <- "LogReg"
-best_lda    <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_lda)$best;    best_lda$Model    <- "LDA"
-best_qda    <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_qda)$best;    best_qda$Model    <- "QDA"
-best_nb     <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_nb)$best;     best_nb$Model     <- "NB"
+best_logreg <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_logreg)$best; best_logreg$Model <- "LogReg"
+best_lda    <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_lda)$best;    best_lda$Model    <- "LDA"
+best_qda    <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_qda)$best;    best_qda$Model    <- "QDA"
+best_nb     <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_nb)$best;     best_nb$Model     <- "NB"
+
 
 val_threshold_summary <- dplyr::bind_rows(best_logreg, best_lda, best_qda, best_nb) |>
-  dplyr::select(Model, threshold, Accuracy, Precision, Sensitivity, Specificity, F1) |>
-  dplyr::arrange(dplyr::desc(F1), dplyr::desc(Sensitivity), dplyr::desc(Accuracy))
+  dplyr::select(Model, threshold, BalancedAcc, Sensitivity, Specificity, Accuracy, Precision, F1) |>
+  dplyr::arrange(dplyr::desc(BalancedAcc), dplyr::desc(Sensitivity), dplyr::desc(Specificity))
 
 print(val_threshold_summary)
 
 best_thresholds <- setNames(val_threshold_summary$threshold, val_threshold_summary$Model)
 
-# >>> BURAYA KOY (best_thresholds satırının HEMEN ALTI) <<<
-all_logreg <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_logreg)$all
-all_lda    <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_lda)$all
-all_qda    <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_qda)$all
-all_nb     <- pick_best_thr(val_sc$Has_Mental_Health_Issue, p_nb)$all
+# use these for plotting curves
+all_logreg <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_logreg)$all
+all_lda    <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_lda)$all
+all_qda    <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_qda)$all
+all_nb     <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_nb)$all
 
 
 
@@ -431,7 +435,6 @@ roc_list <- list(
 ggroc(roc_list, linewidth = 1) +
   theme_minimal(base_size = 14) +
   labs(title = "ROC Curves on Test Set",
-       subtitle = "Comparing model performance (Top left is better)",
        color = "Model") +
   scale_color_viridis_d(end = 0.9) + # Cool colors
   geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") + # Random guess line
