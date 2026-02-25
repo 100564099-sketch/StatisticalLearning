@@ -10,6 +10,7 @@ library(ggplot2)
 library(tidyr)
 library(patchwork)
 library(DMwR)
+library(PRROC)
 
 
 # Load dataset
@@ -182,6 +183,47 @@ Because the target variable Has_Mental_Health_Issue is highly imbalanced, the sp
 
 A fixed random seed (set.seed(42)) was set to make the split reproducible. After splitting, class proportions were printed for the full dataset and for each subset to confirm that stratification was successful.
 '
+
+
+
+# Forward Stepwise (AIC) Feature Selection 
+# Stepwise should be done on ORIGINAL training data (no SMOTE) to avoid synthetic-feature bias
+df_fs <- mental_train
+df_fs$Has_Mental_Health_Issue <- factor(df_fs$Has_Mental_Health_Issue, levels = c("No","Yes"))
+
+m0 <- glm(Has_Mental_Health_Issue ~ 1, data = df_fs, family = binomial())
+m_full <- glm(Has_Mental_Health_Issue ~ ., data = df_fs, family = binomial())
+
+m_fwd <- stepAIC(
+  m0,
+  scope = list(lower = m0, upper = m_full),
+  direction = "forward",
+  trace = FALSE
+)
+
+selected_terms <- attr(terms(m_fwd), "term.labels")
+cat("\n[Stepwise] Selected predictors (AIC):\n")
+print(selected_terms)
+
+keep_cols <- c("Has_Mental_Health_Issue", selected_terms)
+
+# overwrite the same objects so you don't change anything below
+mental_train <- mental_train[, keep_cols, drop = FALSE]
+mental_val   <- mental_val[,   keep_cols, drop = FALSE]
+mental_test  <- mental_test[,  keep_cols, drop = FALSE]
+
+dim(mental_train)
+
+'
+Forward stepwise feature selection (AIC)
+
+To reduce model complexity and avoid using the full set of predictors, a forward stepwise selection procedure based on AIC was applied on the original training set (before SMOTE). This is important because SMOTE generates synthetic observations, which can bias variable selection if used during the stepwise process.
+
+Starting from the intercept-only logistic regression model, predictors were added sequentially to minimize the Akaike Information Criterion (AIC), resulting in a reduced subset of variables. After selection, the dataset was restricted to the selected predictors and the target variable, while keeping the validation and test sets consistent by applying the same column subset.
+
+The feature count was reduced from 51 original columns to 23 columns in the training set (including the target variable). The final stepwise logistic regression contained 24 coefficients including the intercept, because at least one categorical predictor was represented using a dummy indicator in the model matrix.
+'
+
 # ====================================================================================================
 
 
@@ -282,11 +324,10 @@ auc_nb <- mean(auc_each, na.rm = TRUE)
 
 # CV ROC summary
 c(LogReg=max(fit_logreg$results$ROC), LDA=max(fit_lda$results$ROC), QDA=max(fit_qda$results$ROC), NB=auc_nb)
-
 '
 Model training and cross-validation (ROC-AUC)
 
-Model performance was estimated using repeated stratified cross-validation on the standardized, SMOTEd training set. Specifically, 5-fold cross-validation repeated 3 times was used to reduce variance in performance estimates. ROC-AUC was selected as the primary metric (metric = "ROC") because it is threshold-independent and suitable for imbalanced classification.
+Model performance was estimated using repeated stratified cross-validation on the standardized, SMOTEd training set. Specifically, 5-fold cross-validation repeated 3 times was used to reduce variance in performance estimates. ROC-AUC was selected as the primary metric (metric = "ROC") because it is threshold-independent and appropriate for imbalanced classification.
 
 Four baseline classifiers were evaluated:
 
@@ -302,13 +343,13 @@ Logistic regression, LDA, and QDA were trained via caret::train using the same r
 
 The resulting cross-validated ROC-AUC scores were:
 
-LogReg: 0.724
+LogReg: 0.705
 
-LDA: 0.724
+LDA: 0.705
 
-QDA: 0.899
+QDA: 0.795
 
-Naive Bayes: 0.811
+Naive Bayes: 0.750
 '
 # ====================================================================================================
 
@@ -445,7 +486,6 @@ legend <- patchwork::wrap_elements(ggplotGrob(legend_plot + theme(legend.positio
 
 
 
-
 '
 Decision threshold selection on the validation set (Balanced Accuracy)
 
@@ -453,23 +493,22 @@ After model training, each classifier outputs predicted probabilities P(Yes) for
 
 A grid of candidate thresholds from 0.05 to 0.95 (step = 0.01) was evaluated. For each threshold, predicted class labels were generated and a confusion matrix was computed. In addition to standard metrics (Accuracy, Precision, Sensitivity, Specificity, and F1), the main selection criterion was Balanced Accuracy, defined as:
 
-Balanced Accuracy=(Sensitivity+Specificity) / 2
+Balanced Accuracy = (Sensitivity + Specificity) / 2
 
-Balanced Accuracy was used because it gives equal importance to both classes by averaging true-positive rate (Sensitivity) and true-negative rate (Specificity), making it more reliable than Accuracy or F1 in imbalanced settings.
+Balanced Accuracy was used because it gives equal importance to both classes by averaging the true-positive rate (Sensitivity) and true-negative rate (Specificity), making it more reliable than Accuracy or F1 in imbalanced settings.
 
 For each model, the threshold that maximized Balanced Accuracy (with tie-breaking toward higher Sensitivity and then higher Specificity) was selected. The resulting optimal thresholds on the validation set were:
 
-Logistic Regression: threshold = 0.44, BalancedAcc = 0.663
+LDA: threshold = 0.48, BalancedAcc = 0.646
 
-LDA: threshold = 0.44, BalancedAcc = 0.660
+Naive Bayes: threshold = 0.36, BalancedAcc = 0.646
 
-Naive Bayes: threshold = 0.45, BalancedAcc = 0.638
+Logistic Regression: threshold = 0.49, BalancedAcc = 0.644
 
-QDA: threshold = 0.89, BalancedAcc = 0.569
+QDA: threshold = 0.56, BalancedAcc = 0.612
 
 These chosen thresholds were stored and later applied unchanged to the test set to ensure an unbiased final evaluation.
 '
-
 
 
 
@@ -491,7 +530,7 @@ p_nb_test     <- predict(nb_train, newdata = test_sc, type = "raw")[, "Yes"]
 
 #We will evaluate the model using the BEST thresholds that we find on the validation.
 evaluate_test <- function(y_true, prob, threshold, model_name){
-  pred_label <- factor(ifelse(prob >= threshold, "Yes", "No"), levels = c("Yes", "No"))
+  pred_label <- factor(ifelse(prob >= threshold, "Yes", "No"), levels = c("No", "Yes"))
   cm <- caret::confusionMatrix(pred_label, y_true, positive = "Yes")
 
 
@@ -514,10 +553,6 @@ Final_Results <- dplyr:: bind_rows(
   evaluate_test(test_sc$Has_Mental_Health_Issue, p_qda_test,    thr_qda,    "QDA"),
   evaluate_test(test_sc$Has_Mental_Health_Issue, p_nb_test,     thr_nb,     "Naive Bayes")
 )
-
-# Print final results
-print(Final_Results)
-
 
 # ROC AUC CURVES ON TEST SET + AUC labels
 
@@ -547,10 +582,133 @@ ggroc(roc_list, linewidth = 1) +
   theme(legend.position = "bottom",
         plot.title = element_text(face = "bold")) +
   annotate("text",
-           x = 0.65, y = 0.25,   # istersen konumu değiştir
+           x = 0.65, y = 0.25,
            label = auc_text,
            hjust = 0, vjust = 0,
            size = 4)
+
+
+
+
+# ---- Add AUC to Final_Results + pretty print ----
+
+# AUC table
+auc_df <- data.frame(
+  Model = names(auc_vals),
+  Test_AUC = as.numeric(auc_vals),
+  row.names = NULL
+)
+
+# merge + add Balanced Accuracy
+Final_Results2 <- dplyr::left_join(Final_Results, auc_df, by = "Model") %>%
+  dplyr::mutate(
+    Test_BalancedAcc = 0.5 * (Test_Sensitivity + Test_Specificity)
+  ) %>%
+  dplyr::select(Model, Test_AUC, Test_BalancedAcc, Threshold_Used,
+                Test_Accuracy, Test_Sensitivity, Test_Specificity,
+                Test_Precision, Test_F1) %>%
+  dplyr::arrange(dplyr::desc(Test_AUC), dplyr::desc(Test_BalancedAcc))
+
+# nicer printing
+Final_Results2_print <- Final_Results2 %>%
+  dplyr::mutate(
+    dplyr::across(c(Test_AUC, Test_BalancedAcc, Threshold_Used, Test_Accuracy,
+                    Test_Sensitivity, Test_Specificity, Test_Precision, Test_F1),
+                  ~ round(.x, 3))
+  )
+
+print(Final_Results2_print, row.names = FALSE)
+
+
+
+# ================= Confusion matrices for all models (Test) =================
+
+y_test <- test_sc$Has_Mental_Health_Issue
+
+models_list <- list(
+  "LogReg"      = list(prob = p_logreg_test, thr = thr_logreg),
+  "LDA"         = list(prob = p_lda_test,    thr = thr_lda),
+  "QDA"         = list(prob = p_qda_test,    thr = thr_qda),
+  "Naive Bayes" = list(prob = p_nb_test,     thr = thr_nb)
+)
+
+for (m in names(models_list)) {
+  
+  prob <- models_list[[m]]$prob
+  thr  <- models_list[[m]]$thr
+  
+  pred <- factor(ifelse(prob >= thr, "Yes", "No"), levels = c("No","Yes"))
+  cm   <- caret::confusionMatrix(pred, y_test, positive = "Yes")
+  
+  sens <- as.numeric(cm$byClass["Sensitivity"])
+  spec <- as.numeric(cm$byClass["Specificity"])
+  bal  <- 0.5 * (sens + spec)
+  
+  cat("\n====================", m, "====================\n")
+  cat("Threshold:", round(thr, 3), "\n")
+  print(cm$table)
+  cat("Sensitivity:", round(sens, 3),
+      "| Specificity:", round(spec, 3),
+      "| BalancedAcc:", round(bal, 3), "\n")
+}
+
+
+
+'
+        Model Test_AUC Threshold_Used Test_Accuracy Test_Sensitivity Test_Specificity Test_Precision Test_F1
+         LDA    0.644           0.44         0.671            0.683            0.538          0.946   0.793
+      LogReg    0.642           0.44         0.675            0.687            0.526          0.945   0.796
+ Naive Bayes    0.638           0.45         0.624            0.630            0.551          0.943   0.756
+         QDA    0.575           0.89         0.604            0.613            0.494          0.935   0.740
+         
+         ==================== LogReg ====================
+Threshold: 0.49 
+          Reference
+Prediction   No  Yes
+       No   101  782
+       Yes   55 1061
+Sensitivity: 0.576 | Specificity: 0.647 | BalancedAcc: 0.612 
+
+==================== LDA ====================
+Threshold: 0.48 
+          Reference
+Prediction   No  Yes
+       No    99  750
+       Yes   57 1093
+Sensitivity: 0.593 | Specificity: 0.635 | BalancedAcc: 0.614 
+
+==================== QDA ====================
+Threshold: 0.56 
+          Reference
+Prediction  No Yes
+       No  111 937
+       Yes  45 906
+Sensitivity: 0.492 | Specificity: 0.712 | BalancedAcc: 0.602 
+
+==================== Naive Bayes ====================
+Threshold: 0.36 
+          Reference
+Prediction  No Yes
+       No  108 851
+       Yes  48 992
+Sensitivity: 0.538 | Specificity: 0.692 | BalancedAcc: 0.615 
+         
+  
+
+Final test-set evaluation and model selection
+
+After tuning model-specific decision thresholds on the validation set (using Balanced Accuracy), each model was evaluated once on the held-out test set. For each classifier, predicted probabilities 
+
+P(Yes) were converted to class labels using the corresponding validation-selected threshold, and performance metrics were computed from the resulting confusion matrix. In addition, ROC-AUC values were calculated on the test set to provide a threshold-independent measure of discrimination. The ROC curves were plotted together and the AUC values were annotated on the figure.
+
+To support model selection, the final results table reports, for each model: Test_AUC, Test_BalancedAcc, the chosen threshold, and threshold-dependent metrics (Accuracy, Sensitivity, Specificity, Precision, and F1). Because the dataset is imbalanced and “Yes” is the majority class, Accuracy and F1 can be inflated by majority-class performance; therefore, model comparison primarily emphasized ROC-AUC and Balanced Accuracy, with Sensitivity and Specificity inspected jointly to understand the error trade-off.
+
+On the test set, the top-performing models were Naive Bayes (Test_AUC = 0.663, Test_BalancedAcc = 0.615) and LDA (Test_AUC = 0.662, Test_BalancedAcc = 0.614), followed closely by Logistic Regression (Test_AUC = 0.662, Test_BalancedAcc = 0.612). QDA produced the lowest AUC (0.623) and the lowest Balanced Accuracy (0.602), indicating weaker overall discrimination despite relatively high Specificity.
+
+Although Naive Bayes was marginally best according to AUC and Balanced Accuracy, the differences relative to LDA were negligible (≈0.001). The final model was therefore selected as LDA, because it achieved materially higher sensitivity for the “Yes” class on the test set (0.593 vs 0.538 for Naive Bayes), corresponding to fewer false negatives under the validation-selected threshold. This choice prioritizes detecting “Yes” cases while maintaining a comparable overall discrimination level.
+'
+
+
 
 
 
