@@ -146,6 +146,8 @@ ggplot(mental_long,
 # Financial_Stress, and Anxious_Nervous look like strong predictors.
 
 
+
+# ====================================================================================================
 # 60% Train - 20% Validation - 20% Test split via stratified sampling
 set.seed(42)
 
@@ -165,6 +167,22 @@ prop.table(table(mental_train$Has_Mental_Health_Issue))
 prop.table(table(mental_val$Has_Mental_Health_Issue))
 prop.table(table(mental_test$Has_Mental_Health_Issue))
 
+'
+Data splitting: stratified Train / Validation / Test
+
+To evaluate classification performance fairly and avoid optimistic estimates, the dataset was partitioned into three mutually exclusive subsets:
+
+Training set (60%): used to fit the models.
+
+Validation set (20%): used for model/threshold selection and tuning decisions.
+
+Test set (20%): held out until the end to obtain an unbiased estimate of final performance.
+
+Because the target variable Has_Mental_Health_Issue is highly imbalanced, the split was performed using stratified sampling (caret::createDataPartition). Stratification ensures that the class proportions are approximately preserved across train, validation, and test sets, preventing one subset from accidentally containing disproportionately more “Yes” or “No” observations.
+
+A fixed random seed (set.seed(42)) was set to make the split reproducible. After splitting, class proportions were printed for the full dataset and for each subset to confirm that stratification was successful.
+'
+# ====================================================================================================
 
 
 # SMOTE to reduce imbalance
@@ -181,8 +199,26 @@ table(train_smote$Has_Mental_Health_Issue)
 prop.table(table(mental_train$Has_Mental_Health_Issue))
 prop.table(table(train_smote$Has_Mental_Health_Issue))
 
+'
+Class imbalance handling: SMOTE on the training set
 
+The target variable is strongly imbalanced in the training data (No ≈ 7.85%, Yes ≈ 92.15%). To mitigate bias toward the majority class and improve the model’s ability to learn patterns for the minority class, SMOTE (Synthetic Minority Over-sampling Technique) was applied only to the training set.
 
+SMOTE generates synthetic samples of the minority class (“No”) by interpolating between existing minority observations in feature space, and can optionally downsample the majority class. In this workflow, SMOTE was used with:
+
+perc.over = 600: increases the minority class by creating additional synthetic “No” observations.
+
+perc.under = 100: controls the amount of majority-class (“Yes”) sampling relative to the expanded minority class.
+
+After applying SMOTE, the target variable was re-cast as a factor with consistent level ordering (No, Yes). Class distributions were then checked before and after resampling:
+
+Before SMOTE (training set): No = 0.0785, Yes = 0.9215
+
+After SMOTE: No = 0.5385, Yes = 0.4615
+
+This shows that the training data were transformed into a roughly balanced dataset, improving the learning signal for the minority class while keeping the validation and test sets untouched to ensure unbiased evaluation.
+'
+# ====================================================================================================
 
 target_col <- "Has_Mental_Health_Issue"
 num_cols <- names(train_smote)[sapply(train_smote, is.numeric)]
@@ -203,13 +239,17 @@ train_sc <- scale_apply(train_smote, num_cols, mu, sd)
 val_sc   <- scale_apply(mental_val,   num_cols, mu, sd)
 test_sc  <- scale_apply(mental_test,  num_cols, mu, sd)
 
+'
+Feature scaling (standardization)
+
+All numeric predictors were standardized using z-score scaling (subtract mean, divide by standard deviation). The mean and standard deviation were computed only on the SMOTEd training set, then the same parameters were applied to the validation and test sets to prevent data leakage. Variables with zero variance were handled by setting their standard deviation to 1.
+'
+# ====================================================================================================
 
 
 # setup 5-fold cross-validation with 3 repeats
 folds <- createMultiFolds(train_sc$Has_Mental_Health_Issue, k = 5, times = 3)
 ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, index = folds, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final")
-
-
 
 
 # logreg, LDA, QDA cross-validation as initial models
@@ -243,8 +283,34 @@ auc_nb <- mean(auc_each, na.rm = TRUE)
 # CV ROC summary
 c(LogReg=max(fit_logreg$results$ROC), LDA=max(fit_lda$results$ROC), QDA=max(fit_qda$results$ROC), NB=auc_nb)
 
+'
+Model training and cross-validation (ROC-AUC)
 
+Model performance was estimated using repeated stratified cross-validation on the standardized, SMOTEd training set. Specifically, 5-fold cross-validation repeated 3 times was used to reduce variance in performance estimates. ROC-AUC was selected as the primary metric (metric = "ROC") because it is threshold-independent and suitable for imbalanced classification.
 
+Four baseline classifiers were evaluated:
+
+Logistic Regression (GLM, binomial)
+
+Linear Discriminant Analysis (LDA)
+
+Quadratic Discriminant Analysis (QDA)
+
+Naive Bayes
+
+Logistic regression, LDA, and QDA were trained via caret::train using the same resampling scheme and ROC-based summary function. Naive Bayes was evaluated using the identical fold indices in a manual loop to compute fold-level ROC-AUC values, which were then averaged.
+
+The resulting cross-validated ROC-AUC scores were:
+
+LogReg: 0.724
+
+LDA: 0.724
+
+QDA: 0.899
+
+Naive Bayes: 0.811
+'
+# ====================================================================================================
 
 
 # Threshold Selection
@@ -305,6 +371,9 @@ all_nb     <- pick_best_thr_bal(val_sc$Has_Mental_Health_Issue, p_nb)$all
 
 
 
+
+
+
 plot_threshold_effect_one <- function(tbl_all, model_name, best_thr = NULL) {
   
   tbl_long <- tbl_all %>%
@@ -327,9 +396,6 @@ plot_threshold_effect_one <- function(tbl_all, model_name, best_thr = NULL) {
       panel.grid.minor = element_blank()
     ) +
     scale_color_viridis_d(end = 0.9)
-  
-  # default 0.5 line
-  p <- p + geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray50", linewidth = 0.5)
   
   # optional: best threshold line (from your val_threshold_summary)
   if (!is.null(best_thr) && is.finite(best_thr)) {
@@ -372,9 +438,46 @@ legend <- patchwork::wrap_elements(ggplotGrob(legend_plot + theme(legend.positio
 (p1 | p2) / (p3 | p4) +
   plot_annotation(
     title = "Effect of Decision Threshold on Classification Metrics (Validation Set)",
-    subtitle = "Dashed line = 0.5, Solid line = best threshold (by F1)"
+    subtitle = "Solid line = best threshold (by Average of Sensitivity and Specificity)"
   ) &
   theme(legend.position = "bottom")
+
+
+
+
+
+'
+Decision threshold selection on the validation set (Balanced Accuracy)
+
+After model training, each classifier outputs predicted probabilities P(Yes) for the validation set. Since the dataset is imbalanced and a fixed threshold of 0.50 can be suboptimal, the decision threshold was tuned using the validation set.
+
+A grid of candidate thresholds from 0.05 to 0.95 (step = 0.01) was evaluated. For each threshold, predicted class labels were generated and a confusion matrix was computed. In addition to standard metrics (Accuracy, Precision, Sensitivity, Specificity, and F1), the main selection criterion was Balanced Accuracy, defined as:
+
+Balanced Accuracy=(Sensitivity+Specificity) / 2
+
+Balanced Accuracy was used because it gives equal importance to both classes by averaging true-positive rate (Sensitivity) and true-negative rate (Specificity), making it more reliable than Accuracy or F1 in imbalanced settings.
+
+For each model, the threshold that maximized Balanced Accuracy (with tie-breaking toward higher Sensitivity and then higher Specificity) was selected. The resulting optimal thresholds on the validation set were:
+
+Logistic Regression: threshold = 0.44, BalancedAcc = 0.663
+
+LDA: threshold = 0.44, BalancedAcc = 0.660
+
+Naive Bayes: threshold = 0.45, BalancedAcc = 0.638
+
+QDA: threshold = 0.89, BalancedAcc = 0.569
+
+These chosen thresholds were stored and later applied unchanged to the test set to ensure an unbiased final evaluation.
+'
+
+
+
+
+
+
+
+
+
 
 
 # 1 = Yes Majority causes problems when selecting thresholds
@@ -390,7 +493,8 @@ p_nb_test     <- predict(nb_train, newdata = test_sc, type = "raw")[, "Yes"]
 evaluate_test <- function(y_true, prob, threshold, model_name){
   pred_label <- factor(ifelse(prob >= threshold, "Yes", "No"), levels = c("Yes", "No"))
   cm <- caret::confusionMatrix(pred_label, y_true, positive = "Yes")
-  
+
+
 #Extract the metrics
   data.frame(
     Model = model_name,
