@@ -519,28 +519,38 @@ Final_Results <- dplyr:: bind_rows(
 print(Final_Results)
 
 
-# ROC AUC CURVES ON TEST SET TO SHOW AND AUC VALUES(Aesthetic Version)
+# ROC AUC CURVES ON TEST SET + AUC labels
 
-roc_logreg <- roc(test_sc$Has_Mental_Health_Issue, p_logreg_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
-roc_lda    <- roc(test_sc$Has_Mental_Health_Issue, p_lda_test,    levels = c("No", "Yes"), direction = "<", quiet = TRUE)
-roc_qda    <- roc(test_sc$Has_Mental_Health_Issue, p_qda_test,    levels = c("No", "Yes"), direction = "<", quiet = TRUE)
-roc_nb     <- roc(test_sc$Has_Mental_Health_Issue, p_nb_test,     levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+roc_logreg <- roc(test_sc$Has_Mental_Health_Issue, p_logreg_test, levels = c("No","Yes"), direction = "<", quiet = TRUE)
+roc_lda    <- roc(test_sc$Has_Mental_Health_Issue, p_lda_test,    levels = c("No","Yes"), direction = "<", quiet = TRUE)
+roc_qda    <- roc(test_sc$Has_Mental_Health_Issue, p_qda_test,    levels = c("No","Yes"), direction = "<", quiet = TRUE)
+roc_nb     <- roc(test_sc$Has_Mental_Health_Issue, p_nb_test,     levels = c("No","Yes"), direction = "<", quiet = TRUE)
 
-
-# Combine them into a list for ggroc
 roc_list <- list(
-  "LogReg" = roc_logreg,
-  "LDA" = roc_lda,
-  "QDA" = roc_qda,
+  "LogReg"      = roc_logreg,
+  "LDA"         = roc_lda,
+  "QDA"         = roc_qda,
   "Naive Bayes" = roc_nb
 )
 
-# Plot using ggroc (built into pROC, but uses ggplot2)
+# AUC values
+auc_vals <- sapply(roc_list, function(r) as.numeric(auc(r)))
+
+# build label text
+auc_text <- paste0(names(auc_vals), ": AUC = ", sprintf("%.3f", auc_vals), collapse = "\n")
+
 ggroc(roc_list, linewidth = 1) +
   theme_minimal(base_size = 14) +
-  labs(title = "ROC Curves on Test Set",
-       color = "Model") +
-  scale_color_viridis_d(end = 0.9) + # Cool colors
-  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") + # Random guess line
+  labs(title = "ROC Curves on Test Set", color = "Model") +
+  scale_color_viridis_d(end = 0.9) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
   theme(legend.position = "bottom",
-        plot.title = element_text(face = "bold"))
+        plot.title = element_text(face = "bold")) +
+  annotate("text",
+           x = 0.65, y = 0.25,   # istersen konumu değiştir
+           label = auc_text,
+           hjust = 0, vjust = 0,
+           size = 4)
+
+
+
