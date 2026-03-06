@@ -11,6 +11,7 @@ library(tidyr)
 library(patchwork)
 library(DMwR)
 library(PRROC)
+library(kernlab)
 
 
 # Load dataset
@@ -769,7 +770,7 @@ On the test set, the top-performing models were Naive Bayes (Test_AUC = 0.663, T
 Although Naive Bayes was marginally best according to AUC and Balanced Accuracy, the differences relative to LDA were negligible (≈0.001). The final model was therefore selected as LDA, because it achieved materially higher sensitivity for the “Yes” class on the test set (0.593 vs 0.538 for Naive Bayes), corresponding to fewer false negatives under the validation-selected threshold. This choice prioritizes detecting “Yes” cases while maintaining a comparable overall discrimination level.
 '
 
+'--------------------'
 
-
-
+# Part 2: Machine Learning Models
 
