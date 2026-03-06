@@ -772,11 +772,52 @@ Although Naive Bayes was marginally best according to AUC and Balanced Accuracy,
 
 '--------------------'
 
+
+
+
+
+# ====================================================================
+# ====================================================================
+# ====================================================================
+# ====================================================================
 # Part 2: Machine Learning Models
+# ====================================================================
+# ====================================================================
+# ====================================================================
+# ====================================================================
 
 
 
+setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
+
+# Libraries
+library(caret)
+library(MASS)
+library(dplyr)
+library(e1071)
+library(pROC)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(DMwR)
+library(PRROC)
+library(kernlab)
 
 
+# Load dataset
+mental = read.csv("mental_health.csv")
+
+# Check size and structure of data
+dim(mental)     # number of rows and columns
+str(mental)     # variable types
 
 
+# 2. Data Preparation
+# Convert target variable to factor (classification task)
+
+
+mental$Has_Mental_Health_Issue <- factor(
+  mental$Has_Mental_Health_Issue,
+  levels = c("0", "1"),
+  labels = c("No", "Yes")
+)
