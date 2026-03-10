@@ -855,6 +855,7 @@ print(cm_k3_table)
 k_values <- 1:30
 bal_acc_k <- numeric(length(k_values))
 
+<<<<<<< Updated upstream
 for (i in seq_along(k_values)) {
   
   set.seed(42)
@@ -872,6 +873,21 @@ for (i in seq_along(k_values)) {
   spec_i <- as.numeric(cm_i$byClass["Specificity"])
   
   bal_acc_k[i] <- 0.5 * (sens_i + spec_i)
+=======
+#Scaling numeric predictors
+num_cols = names(train_smote)[sapply(train_smote, is.numeric)]
+num_cols = setdiff(num_cols, "Has_Mental_Health_Issue")
+
+mu = sapply(train_smote[, num_cols, drop = FALSE], mean)
+sd = sapply(train_smote[, num_cols, drop = FALSE], sd)
+sd[sd == 0] = 1
+
+scale_apply = function(df, num_cols, mu, sd) {
+  out = df
+  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
+  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
+  out
+>>>>>>> Stashed changes
 }
 
 best_k <- k_values[which.max(bal_acc_k)]
