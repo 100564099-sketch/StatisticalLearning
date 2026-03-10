@@ -792,6 +792,91 @@ Although Naive Bayes was marginally best according to AUC and Balanced Accuracy,
 # ====================================================================
 # ====================================================================
 # ====================================================================
+# Libraries
+library(caret)
+library(MASS)
+library(dplyr)
+library(e1071)
+library(pROC)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(DMwR)
+library(PRROC)
+library(kernlab)
+library(randomForest)
+library(xgboost)
+library(kknn)
+
+# Load dataset
+mental = read.csv("mental_health.csv")
+
+# Check size and structure of data
+dim(mental)     # number of rows and columns
+str(mental)     # variable types
+
+
+# Data Preparation
+# Convert target variable to factor (classification task)
+
+
+mental$Has_Mental_Health_Issue <- factor(
+  mental$Has_Mental_Health_Issue,
+  levels = c("0", "1"),
+  labels = c("No", "Yes")
+)
+
+#Convert all the character variables to factors
+mental[] = lapply(mental, function(x) if(is.character(x)) as.factor(x) else x)
+
+# We will start the data splitting (60% train, 20% validation, 20% test) 
+set.seed(42)  # for reproducibility
+idx_train = createDataPartition(mental$Has_Mental_Health_Issue, p = 0.60, list = FALSE)
+mental_train = mental[idx_train, ]
+mental_tmp   = mental[-idx_train, ]
+
+idx_val = createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)
+mental_val  = mental_tmp[idx_val, ]
+mental_test = mental_tmp[-idx_val, ]
+
+# We will start the feature selection with forward stepwise selection based on AIC
+
+df_fs = mental_train
+m0_fs = glm(Has_Mental_Health_Issue ~ 1, data = df_fs, family = binomial())
+m_full = glm(Has_Mental_Health_Issue ~ ., data = df_fs, family = binomial())
+
+m_fwd = stepAIC(m0_fs, scope = list(lower = m0_fs, upper = m_full), direction = "forward", trace = FALSE)
+selected_terms = attr(terms(m_fwd), "term.labels")
+
+keep_cols = c("Has_Mental_Health_Issue", selected_terms)
+mental_train = mental_train[, keep_cols, drop = FALSE]
+mental_val   = mental_val[,   keep_cols, drop = FALSE]
+mental_test  = mental_test[,  keep_cols, drop = FALSE]
+
+# SMOTE to handle class imbalance in the training set
+
+# We will apply SMOTE to the training data
+train_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = mental_train, perc.over = 600, perc.under = 100)
+train_smote$Has_Mental_Health_Issue <- factor(train_smote$Has_Mental_Health_Issue, levels = c("No", "Yes"))
+
+#Scaling numeric predictors
+num_cols = names(train_smote)[sapply(train_smote, is.numeric)]
+num_cols = setdiff(num_cols, "Has_Mental_Health_Issue")
+
+mu = sapply(train_smote[, num_cols, drop = FALSE], mean)
+sd = sapply(train_smote[, num_cols, drop = FALSE], sd)
+sd[sd == 0] = 1
+
+scale_apply = function(df, num_cols, mu, sd) {
+  out = df
+  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
+  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
+  out
+}
+
+train_sc = scale_apply(train_smote, num_cols, mu, sd)
+val_sc   = scale_apply(mental_val,   num_cols, mu, sd)
+test_sc  = scale_apply(mental_test,  num_cols, mu, sd)
 
 #===== k-NEAREST NEIGHBOURS=====
 
