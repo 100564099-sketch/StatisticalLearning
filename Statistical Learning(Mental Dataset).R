@@ -12,6 +12,13 @@ library(patchwork)
 library(DMwR)
 library(PRROC)
 library(kernlab)
+library(e1071)
+library(viridis)
+library(randomForest)
+library(purrr)
+library(forcats)
+library(tibble)
+library(tree) 
 
 
 # Load dataset
@@ -786,120 +793,908 @@ Although Naive Bayes was marginally best according to AUC and Balanced Accuracy,
 # ====================================================================
 # ====================================================================
 
+#===== k-NEAREST NEIGHBOURS=====
 
+# Prepare data
+X_train <- train_sc[, setdiff(names(train_sc), target_col)]
+y_train <- train_sc[[target_col]]
 
-setwd("/Users/utkusizanli/Desktop/UC3M/StatisticalLearningGitHub")
+X_val <- val_sc[, setdiff(names(val_sc), target_col)]
+y_val <- val_sc[[target_col]]
 
-# Libraries
-library(caret)
-library(MASS)
-library(dplyr)
-library(e1071)
-library(pROC)
-library(ggplot2)
-library(tidyr)
-library(patchwork)
-library(DMwR)
-library(PRROC)
-library(kernlab)
-library(randomForest)
-library(xgboost)
-library(kknn)
+X_test <- test_sc[, setdiff(names(test_sc), target_col)]
+y_test <- test_sc[[target_col]]
 
-# Load dataset
-mental = read.csv("mental_health.csv")
+# Keep numeric variables
+num_feature_cols <- names(X_train)[sapply(X_train, is.numeric)]
 
-# Check size and structure of data
-dim(mental)     # number of rows and columns
-str(mental)     # variable types
+X_train_num <- as.matrix(X_train[, num_feature_cols])
+X_val_num   <- as.matrix(X_val[, num_feature_cols])
+X_test_num  <- as.matrix(X_test[, num_feature_cols])
 
-
-# Data Preparation
-# Convert target variable to factor (classification task)
-
-
-mental$Has_Mental_Health_Issue <- factor(
-  mental$Has_Mental_Health_Issue,
-  levels = c("0", "1"),
-  labels = c("No", "Yes")
+data_info <- data.frame(
+  Item = c("Numeric predictors", "Training rows", "Validation rows", "Test rows"),
+  Value = c(length(num_feature_cols), nrow(X_train_num), nrow(X_val_num), nrow(X_test_num))
 )
 
-#Convert all the character variables to factors
-mental[] = lapply(mental, function(x) if(is.character(x)) as.factor(x) else x)
+print(data_info)
 
-# We will start the data splitting (60% train, 20% validation, 20% test) 
-set.seed(42)  # for reproducibility
-idx_train = createDataPartition(mental$Has_Mental_Health_Issue, p = 0.60, list = FALSE)
-mental_train = mental[idx_train, ]
-mental_tmp   = mental[-idx_train, ]
+# First model k = 3
+set.seed(42)
 
-idx_val = createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)
-mental_val  = mental_tmp[idx_val, ]
-mental_test = mental_tmp[-idx_val, ]
+knn_k3 <- knn(
+  train = X_train_num,
+  test  = X_val_num,
+  cl    = y_train,
+  k     = 3
+)
 
-# We will start the feature selection with forward stepwise selection based on AIC
+cm_k3 <- confusionMatrix(knn_k3, y_val, positive = "Yes")
 
-df_fs = mental_train
-m0_fs = glm(Has_Mental_Health_Issue ~ 1, data = df_fs, family = binomial())
-m_full = glm(Has_Mental_Health_Issue ~ ., data = df_fs, family = binomial())
+k3_summary <- data.frame(
+  Metric = c("Accuracy","Sensitivity","Specificity","Balanced Accuracy"),
+  Value = c(
+    as.numeric(cm_k3$overall["Accuracy"]),
+    as.numeric(cm_k3$byClass["Sensitivity"]),
+    as.numeric(cm_k3$byClass["Specificity"]),
+    0.5 * (
+      as.numeric(cm_k3$byClass["Sensitivity"]) +
+        as.numeric(cm_k3$byClass["Specificity"])
+    )
+  )
+)
 
-m_fwd = stepAIC(m0_fs, scope = list(lower = m0_fs, upper = m_full), direction = "forward", trace = FALSE)
-selected_terms = attr(terms(m_fwd), "term.labels")
+print(k3_summary)
 
-keep_cols = c("Has_Mental_Health_Issue", selected_terms)
-mental_train = mental_train[, keep_cols, drop = FALSE]
-mental_val   = mental_val[,   keep_cols, drop = FALSE]
-mental_test  = mental_test[,  keep_cols, drop = FALSE]
+cm_k3_table <- as.data.frame(cm_k3$table)
+colnames(cm_k3_table) <- c("Prediction","Reference","Count")
 
-# SMOTE to handle class imbalance in the training set
+print(cm_k3_table)
 
-# We will apply SMOTE to the training data
-train_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = mental_train, perc.over = 600, perc.under = 100)
-train_smote$Has_Mental_Health_Issue <- factor(train_smote$Has_Mental_Health_Issue, levels = c("No", "Yes"))
+# Tune k
+k_values <- 1:30
+bal_acc_k <- numeric(length(k_values))
 
-#Scaling numeric predictors
-num_cols = names(train_smote)[sapply(train_smote, is.numeric)]
-num_cols = setdiff(num_cols, "Has_Mental_Health_Issue")
-
-mu = sapply(train_smote[, num_cols, drop = FALSE], 2, mean)
-sd = sapply(train_smote[, num_cols, drop = FALSE], 2, sd)
-sd[sd == 0] = 1
-
-scale_apply = function(df, num_cols, mu, sd) {
-  out = df
-  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
-  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
-  out
+for (i in seq_along(k_values)) {
+  
+  set.seed(42)
+  
+  pred_i <- knn(
+    train = X_train_num,
+    test  = X_val_num,
+    cl    = y_train,
+    k     = k_values[i]
+  )
+  
+  cm_i <- confusionMatrix(pred_i, y_val, positive = "Yes")
+  
+  sens_i <- as.numeric(cm_i$byClass["Sensitivity"])
+  spec_i <- as.numeric(cm_i$byClass["Specificity"])
+  
+  bal_acc_k[i] <- 0.5 * (sens_i + spec_i)
 }
 
-train_sc = scale_apply(train_smote, num_cols, mu, sd)
-val_sc   = scale_apply(mental_val,   num_cols, mu, sd)
-test_sc  = scale_apply(mental_test,  num_cols, mu, sd)
+best_k <- k_values[which.max(bal_acc_k)]
+
+k_results <- data.frame(
+  k = k_values,
+  Balanced_Accuracy = bal_acc_k
+)
+
+print(k_results)
+
+best_k_table <- data.frame(
+  Measure = c("Best k","Best Balanced Accuracy"),
+  Value = c(best_k, round(max(bal_acc_k),4))
+)
+
+print(best_k_table)
+
+ggplot(k_results, aes(x = k, y = Balanced_Accuracy)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_vline(xintercept = best_k, linetype = "dashed", color = "red") +
+  annotate(
+    "text",
+    x = best_k + 0.5,
+    y = min(bal_acc_k) + 0.005,
+    label = paste("k =", best_k),
+    color = "red",
+    hjust = 0
+  ) +
+  labs(
+    title = "k-NN: Balanced Accuracy vs k",
+    subtitle = "Validation set",
+    x = "k",
+    y = "Balanced Accuracy"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Cross validation
+knn_formula <- reformulate(num_feature_cols, response="Has_Mental_Health_Issue")
+
+ctrl_cv <- trainControl(
+  method="repeatedcv",
+  number=5,
+  repeats=3,
+  classProbs=TRUE,
+  summaryFunction=twoClassSummary,
+  savePredictions="final"
+)
+
+set.seed(42)
+
+knn_cv <- train(
+  knn_formula,
+  data=train_sc,
+  method="knn",
+  trControl=ctrl_cv,
+  tuneGrid=data.frame(k=1:30),
+  metric="ROC"
+)
+
+cv_results <- knn_cv$results[,c("k","ROC","Sens","Spec")]
+
+print(cv_results)
+
+cv_best <- data.frame(
+  Measure=c("Best k","Best ROC"),
+  Value=c(knn_cv$bestTune$k, round(max(knn_cv$results$ROC),4))
+)
+
+print(cv_best)
+
+plot(knn_cv)
+
+# Threshold selection
+p_knn_val <- predict(knn_cv,newdata=val_sc,type="prob")[,"Yes"]
+
+thr_grid <- seq(0.05,0.95,by=0.01)
+
+calc_metrics_bal <- function(y_true,prob_yes,thr){
+  
+  pred <- factor(
+    ifelse(prob_yes >= thr,"Yes","No"),
+    levels=c("No","Yes")
+  )
+  
+  cm <- confusionMatrix(pred,y_true,positive="Yes")
+  
+  sens <- as.numeric(cm$byClass["Sensitivity"])
+  spec <- as.numeric(cm$byClass["Specificity"])
+  prec <- as.numeric(cm$byClass["Pos Pred Value"])
+  acc  <- as.numeric(cm$overall["Accuracy"])
+  
+  bal <- 0.5*(sens+spec)
+  
+  data.frame(
+    Threshold=thr,
+    Accuracy=acc,
+    Sensitivity=sens,
+    Specificity=spec,
+    Balanced_Accuracy=bal,
+    Precision=prec
+  )
+}
+
+thr_results_knn <- bind_rows(
+  lapply(thr_grid,function(t) calc_metrics_bal(y_val,p_knn_val,t))
+)
+
+best_thr_row <- thr_results_knn %>%
+  arrange(desc(Balanced_Accuracy)) %>%
+  slice(1)
+
+best_thr_knn <- best_thr_row$Threshold
+
+print(best_thr_row)
+
+# Test results
+p_knn_test <- predict(knn_cv,newdata=test_sc,type="prob")[,"Yes"]
+
+pred_knn_test <- factor(
+  ifelse(p_knn_test >= best_thr_knn,"Yes","No"),
+  levels=c("No","Yes")
+)
+
+cm_test <- confusionMatrix(pred_knn_test,y_test,positive="Yes")
+
+roc_knn <- roc(
+  y_test,
+  p_knn_test,
+  levels=c("No","Yes"),
+  direction="<",
+  quiet=TRUE
+)
+
+auc_knn <- as.numeric(auc(roc_knn))
+
+sens_test <- as.numeric(cm_test$byClass["Sensitivity"])
+spec_test <- as.numeric(cm_test$byClass["Specificity"])
+prec_test <- as.numeric(cm_test$byClass["Pos Pred Value"])
+f1_test   <- as.numeric(cm_test$byClass["F1"])
+acc_test  <- as.numeric(cm_test$overall["Accuracy"])
+
+bal_test <- 0.5*(sens_test+spec_test)
+
+knn_test_summary <- data.frame(
+  Model=paste0("kNN (k=",knn_cv$bestTune$k,")"),
+  Test_AUC=round(auc_knn,3),
+  Balanced_Accuracy=round(bal_test,3),
+  Threshold=round(best_thr_knn,2),
+  Accuracy=round(acc_test,3),
+  Sensitivity=round(sens_test,3),
+  Specificity=round(spec_test,3),
+  Precision=round(prec_test,3),
+  F1=round(f1_test,3)
+)
+
+print(knn_test_summary)
+
+cm_test_table <- as.data.frame(cm_test$table)
+colnames(cm_test_table) <- c("Prediction","Reference","Count")
+
+print(cm_test_table)
+
+# ROC plot
+ggroc(roc_knn,linewidth=1,color="steelblue") +
+  geom_abline(slope=1,intercept=1,linetype="dashed") +
+  labs(
+    title="k-NN ROC Curve",
+    subtitle=paste("AUC =",round(auc_knn,3)),
+    x="Specificity",
+    y="Sensitivity"
+  ) +
+  theme_minimal()
+
+# Confusion matrix plot
+cm_df <- as.data.frame(cm_test$table)
+colnames(cm_df) <- c("Prediction","Reference","Freq")
+
+ggplot(cm_df,aes(x=Reference,y=Prediction,fill=Freq)) +
+  geom_tile(color="white") +
+  geom_text(aes(label=Freq),size=7) +
+  scale_fill_gradient(low="white",high="steelblue") +
+  labs(
+    title="k-NN Confusion Matrix",
+    x="Actual",
+    y="Predicted"
+  ) +
+  theme_minimal()
+
+knn_summary <- data.frame(
+  Model = c("k-NN"),
+  Main_Setting = c(paste0("k = ", knn_cv$bestTune$k)),
+  Threshold = c(round(best_thr_knn, 2)),
+  Test_AUC = c(round(auc_knn, 3)),
+  Balanced_Accuracy = c(round(bal_test, 3)),
+  Sensitivity = c(round(sens_test, 3)),
+  Specificity = c(round(spec_test, 3))
+)
+
+print(knn_summary)
+
+#==============================================================================
+# k-Nearest Neighbours 
+#
+# The k-NN model performed worst among the tested models, achieving a
+# test AUC of 0.572, which is only slightly above random guessing (0.5).
+# This is lower than the best model from Part 1 (LDA, AUC = 0.644).
+#
+# The weak performance is mainly due to two reasons. First, with 21
+# predictors, the differences between observations become less useful,
+# which reduces the effectiveness of nearest-neighbors methods.
+# Second, the class imbalance in the data affects how k-NN identifies
+# similar points in the neighborhood.
+#
+# The large gap between the cross-validation ROC (0.924) and the test
+# performance occurs because cross-validation was performed on training
+# data balanced with SMOTE, while the test set reflects the true class
+# distribution.
+#
+# Overall, k-NN does not perform well for this problem. Linear models
+# such as LDA and Logistic Regression perform better because they use
+# patterns from the whole dataset rather than relying only on nearby
+# observations.
+
+# Key results:
+#   Best k:             5 (cross-validation)
+#   Threshold:          0.81
+#   Test AUC:           0.572
+#   Balanced Accuracy:  0.530
+#   Sensitivity:        0.239
+#   Specificity:        0.821
+# ==============================================================================
+
+# Threshold helper
+
+calc_metrics_bal <- function(y_true, prob_yes, thr) {
+  pred <- factor(
+    ifelse(prob_yes >= thr, "Yes", "No"),
+    levels = c("No", "Yes")
+  )
+  
+  cm <- caret::confusionMatrix(pred, y_true, positive = "Yes")
+  
+  sens <- as.numeric(cm$byClass["Sensitivity"])
+  spec <- as.numeric(cm$byClass["Specificity"])
+  bal  <- 0.5 * (sens + spec)
+  prec <- as.numeric(cm$byClass["Pos Pred Value"])
+  
+  f1 <- if (is.na(prec) || is.na(sens) || (prec + sens) == 0) {
+    NA_real_
+  } else {
+    2 * prec * sens / (prec + sens)
+  }
+  
+  data.frame(
+    threshold = thr,
+    Sensitivity = sens,
+    Specificity = spec,
+    BalancedAcc = bal,
+    Precision = prec,
+    F1 = f1,
+    Accuracy = as.numeric(cm$overall["Accuracy"])
+  )
+}
+
+pick_best_thr <- function(y_true, prob_yes) {
+  thr_grid <- seq(0.05, 0.95, by = 0.01)
+  
+  tbl <- dplyr::bind_rows(
+    lapply(thr_grid, function(t) calc_metrics_bal(y_true, prob_yes, t))
+  )
+  
+  tbl %>%
+    arrange(desc(BalancedAcc), desc(Sensitivity), desc(Specificity)) %>%
+    slice(1)
+}
+
+# Initial decision tree
+
+set.seed(42)
+mental_tree_init <- tree(
+  Has_Mental_Health_Issue ~ .,
+  data = train_smote,
+  control = tree.control(
+    nobs = nrow(train_smote),
+    mindev = 0.01,
+    minsize = 10
+  )
+)
+
+tree_init_summary <- data.frame(
+  Measure = c("Tree type", "mindev", "minsize"),
+  Value = c("Initial decision tree", 0.01, 10)
+)
+
+print(tree_init_summary)
+print(summary(mental_tree_init))
+
+plot(mental_tree_init)
+text(mental_tree_init, pretty = 0, cex = 0.75)
+title("Mental Health: Initial Classification Tree")
+
+# Full tree and pruning
+
+set.seed(42)
+mental_tree_full <- tree(
+  Has_Mental_Health_Issue ~ .,
+  data = train_smote,
+  control = tree.control(
+    nobs = nrow(train_smote),
+    mindev = 0,
+    minsize = 2
+  )
+)
+
+full_tree_info <- data.frame(
+  Measure = c("Tree type", "Terminal nodes"),
+  Value = c(
+    "Full unpruned tree",
+    mental_tree_full$frame %>% filter(var == "<leaf>") %>% nrow()
+  )
+)
+
+print(full_tree_info)
+
+set.seed(42)
+mental_cv <- cv.tree(mental_tree_full, FUN = prune.misclass)
+
+cv_results_tree <- data.frame(
+  size = mental_cv$size,
+  cv_error = mental_cv$dev
+)
+
+print(cv_results_tree)
+
+min_dev <- min(mental_cv$dev, na.rm = TRUE)
+best_size <- min(mental_cv$size[mental_cv$dev == min_dev], na.rm = TRUE)
+
+best_size_table <- data.frame(
+  Measure = c("Minimum CV error", "Best tree size"),
+  Value = c(min_dev, best_size)
+)
+
+print(best_size_table)
+
+tibble(size = mental_cv$size, cv_error = mental_cv$dev) %>%
+  ggplot(aes(x = size, y = cv_error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_vline(xintercept = best_size, linetype = "dashed", color = "red") +
+  annotate(
+    "text",
+    x = best_size + 0.3,
+    y = max(mental_cv$dev) * 0.98,
+    label = paste("best =", best_size),
+    color = "red",
+    hjust = 0
+  ) +
+  labs(
+    title = "Decision Tree: CV Error vs Tree Size",
+    subtitle = paste("Best size =", best_size),
+    x = "Number of terminal nodes",
+    y = "CV misclassification count"
+  ) +
+  theme_minimal(base_size = 13)
+
+mental_tree_pruned <- prune.misclass(mental_tree_full, best = best_size)
+
+plot(mental_tree_pruned)
+text(mental_tree_pruned, pretty = 0, cex = 0.8)
+title(paste("Mental Health: Pruned Tree (", best_size, " leaves)"))
+
+# Tree threshold selection
+
+tree_prob_val <- predict(mental_tree_pruned, newdata = mental_val, type = "vector")
+p_tree_val <- as.numeric(tree_prob_val[, "Yes"])
+
+best_thr_tree_row <- pick_best_thr(mental_val[[target_col]], p_tree_val)
+best_thr_tree <- best_thr_tree_row$threshold
+
+print(best_thr_tree_row)
+
+# Tree test evaluation
+
+tree_prob_test <- predict(mental_tree_pruned, newdata = mental_test, type = "vector")
+p_tree_test <- as.numeric(tree_prob_test[, "Yes"])
+
+pred_tree_test <- factor(
+  ifelse(p_tree_test >= best_thr_tree, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+y_test <- mental_test[[target_col]]
+cm_tree <- confusionMatrix(pred_tree_test, y_test, positive = "Yes")
+roc_tree <- roc(y_test, p_tree_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+auc_tree <- as.numeric(auc(roc_tree))
+
+sens_tree <- as.numeric(cm_tree$byClass["Sensitivity"])
+spec_tree <- as.numeric(cm_tree$byClass["Specificity"])
+bal_tree <- 0.5 * (sens_tree + spec_tree)
+acc_tree <- as.numeric(cm_tree$overall["Accuracy"])
+f1_tree <- as.numeric(cm_tree$byClass["F1"])
+
+tree_test_info <- data.frame(
+  Measure = c("Best tree size", "Threshold", "Test AUC"),
+  Value = c(best_size, best_thr_tree, round(auc_tree, 4))
+)
+
+print(tree_test_info)
+print(cm_tree)
+
+metrics_tree <- tibble(
+  Model = paste0("Decision Tree (", best_size, " leaves)"),
+  Test_AUC = round(auc_tree, 3),
+  Test_BalancedAcc = round(bal_tree, 3),
+  Threshold = best_thr_tree,
+  Test_Sensitivity = round(sens_tree, 3),
+  Test_Specificity = round(spec_tree, 3),
+  Test_Accuracy = round(acc_tree, 3),
+  Test_F1 = round(f1_tree, 3)
+)
+
+print(metrics_tree)
+
+ggroc(roc_tree, linewidth = 1, color = "steelblue") +
+  theme_minimal(base_size = 14) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Decision Tree ROC Curve",
+    subtitle = paste0(
+      "AUC = ", round(auc_tree, 3),
+      " | Size = ", best_size,
+      " | Threshold = ", best_thr_tree
+    )
+  ) +
+  annotate(
+    "text",
+    x = 0.4,
+    y = 0.15,
+    label = paste0("AUC = ", round(auc_tree, 3)),
+    size = 5,
+    color = "steelblue"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+cm_tree_df <- as.data.frame(cm_tree$table)
+colnames(cm_tree_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_tree_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = paste0("Decision Tree Confusion Matrix (thr = ", best_thr_tree, ")"),
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+# Bagging
+
+p <- ncol(train_smote) - 1
+
+set.seed(42)
+mental_bag <- randomForest(
+  Has_Mental_Health_Issue ~ .,
+  data = train_smote,
+  mtry = p,
+  ntree = 350,
+  importance = TRUE
+)
+
+bagging_info <- data.frame(
+  Measure = c("Model", "mtry", "ntree"),
+  Value = c("Bagging", p, 350)
+)
+
+print(bagging_info)
+print(mental_bag)
+
+bag_prob_val <- predict(mental_bag, newdata = mental_val, type = "prob")[, "Yes"]
+best_thr_bag_row <- pick_best_thr(mental_val[[target_col]], bag_prob_val)
+
+bag_validation <- data.frame(
+  Measure = c("Best threshold", "Validation Balanced Accuracy"),
+  Value = c(best_thr_bag_row$threshold, round(best_thr_bag_row$BalancedAcc, 4))
+)
+
+print(bag_validation)
+
+# Random forest mtry tuning
+
+base_mtry <- max(1, floor(sqrt(p)))
+mtry_grid <- sort(unique(pmax(1, pmin(p, c(base_mtry - 1, base_mtry, base_mtry + 1, floor(p / 3), p)))))
+
+mtry_grid_table <- data.frame(
+  mtry = mtry_grid
+)
+
+print(mtry_grid_table)
+
+rf_tuning <- map_dfr(mtry_grid, function(m) {
+  set.seed(42 + m)
+  
+  fit <- randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data = train_smote,
+    mtry = m,
+    ntree = 250
+  )
+  
+  tibble(
+    mtry = m,
+    OOB_Error = fit$err.rate[250, "OOB"]
+  )
+})
+
+best_mtry <- rf_tuning$mtry[which.min(rf_tuning$OOB_Error)]
+
+print(rf_tuning)
+
+best_mtry_table <- data.frame(
+  Measure = c("Best mtry", "Minimum OOB error"),
+  Value = c(best_mtry, min(rf_tuning$OOB_Error))
+)
+
+print(best_mtry_table)
+
+ggplot(rf_tuning, aes(x = mtry, y = OOB_Error)) +
+  geom_line(color = "#41ab5d", linewidth = 1) +
+  geom_point(color = "#41ab5d", size = 3) +
+  geom_vline(xintercept = best_mtry, linetype = "dashed", color = "red") +
+  annotate(
+    "text",
+    x = best_mtry + 0.2,
+    y = max(rf_tuning$OOB_Error),
+    label = paste("best mtry =", best_mtry),
+    color = "red",
+    hjust = 0
+  ) +
+  labs(
+    title = "Random Forest: OOB Error vs mtry",
+    x = "mtry",
+    y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Final random forest
+
+set.seed(42)
+mental_rf <- randomForest(
+  Has_Mental_Health_Issue ~ .,
+  data = train_smote,
+  mtry = best_mtry,
+  ntree = 350,
+  importance = TRUE
+)
+
+rf_info <- data.frame(
+  Measure = c("Model", "Best mtry", "ntree"),
+  Value = c("Random Forest", best_mtry, 350)
+)
+
+print(rf_info)
+print(mental_rf)
+
+oob_df <- tibble(
+  Trees = seq_len(nrow(mental_rf$err.rate)),
+  OOB_Error = mental_rf$err.rate[, "OOB"]
+)
+
+ggplot(oob_df, aes(x = Trees, y = OOB_Error)) +
+  geom_line(color = "#2c7fb8", linewidth = 1) +
+  labs(
+    title = "Random Forest: OOB Error vs Number of Trees",
+    subtitle = "Stabilises before ntree = 350",
+    x = "Number of Trees",
+    y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Variable importance
+
+varImpPlot(
+  mental_rf,
+  main = "Mental Health RF Variable Importance",
+  cex = 0.8
+)
+
+imp_df <- as.data.frame(importance(mental_rf))
+imp_df$Variable <- rownames(imp_df)
+
+imp_cols <- intersect(c("MeanDecreaseAccuracy", "MeanDecreaseGini"), names(imp_df))
+
+imp_long <- imp_df %>%
+  select(Variable, all_of(imp_cols)) %>%
+  pivot_longer(cols = -Variable, names_to = "Measure", values_to = "Importance")
+
+ggplot(
+  imp_long,
+  aes(x = fct_reorder(Variable, Importance), y = Importance, fill = Measure)
+) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  coord_flip() +
+  facet_wrap(~ Measure, scales = "free_x") +
+  labs(
+    title = "Random Forest Variable Importance",
+    x = NULL,
+    y = "Importance"
+  ) +
+  scale_fill_viridis_d() +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+# RF threshold selection
+
+rf_prob_val <- predict(mental_rf, newdata = mental_val, type = "prob")[, "Yes"]
+best_thr_rf_row <- pick_best_thr(mental_val[[target_col]], rf_prob_val)
+best_thr_rf <- best_thr_rf_row$threshold
+
+print(best_thr_rf_row)
+
+# RF test evaluation
+
+rf_prob_test <- predict(mental_rf, newdata = mental_test, type = "prob")[, "Yes"]
+
+pred_rf_test <- factor(
+  ifelse(rf_prob_test >= best_thr_rf, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+cm_rf <- confusionMatrix(pred_rf_test, y_test, positive = "Yes")
+roc_rf <- roc(y_test, rf_prob_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+auc_rf <- as.numeric(auc(roc_rf))
+
+sens_rf <- as.numeric(cm_rf$byClass["Sensitivity"])
+spec_rf <- as.numeric(cm_rf$byClass["Specificity"])
+bal_rf <- 0.5 * (sens_rf + spec_rf)
+acc_rf <- as.numeric(cm_rf$overall["Accuracy"])
+f1_rf <- as.numeric(cm_rf$byClass["F1"])
+
+rf_test_info <- data.frame(
+  Measure = c("Best mtry", "ntree", "Threshold", "Test AUC"),
+  Value = c(best_mtry, 350, best_thr_rf, round(auc_rf, 4))
+)
+
+print(rf_test_info)
+print(cm_rf)
+
+metrics_rf <- tibble(
+  Model = paste0("Random Forest (mtry=", best_mtry, ")"),
+  Test_AUC = round(auc_rf, 3),
+  Test_BalancedAcc = round(bal_rf, 3),
+  Threshold = best_thr_rf,
+  Test_Sensitivity = round(sens_rf, 3),
+  Test_Specificity = round(spec_rf, 3),
+  Test_Accuracy = round(acc_rf, 3),
+  Test_F1 = round(f1_rf, 3)
+)
+
+print(metrics_rf)
+
+ggroc(roc_rf, linewidth = 1, color = "#41ab5d") +
+  theme_minimal(base_size = 14) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Random Forest ROC Curve",
+    subtitle = paste0(
+      "AUC = ", round(auc_rf, 3),
+      " | mtry = ", best_mtry,
+      " | Threshold = ", best_thr_rf
+    )
+  ) +
+  annotate(
+    "text",
+    x = 0.4,
+    y = 0.15,
+    label = paste0("AUC = ", round(auc_rf, 3)),
+    size = 5,
+    color = "#41ab5d"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+cm_rf_df <- as.data.frame(cm_rf$table)
+colnames(cm_rf_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_rf_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#41ab5d") +
+  labs(
+    title = paste0("Random Forest Confusion Matrix (thr = ", best_thr_rf, ")"),
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+# Tree and RF summary
+
+tree_rf_summary <- data.frame(
+  Model = c("Decision Tree", "Random Forest"),
+  Main_Setting = c(
+    paste0(best_size, " leaves"),
+    paste0("mtry = ", best_mtry)
+  ),
+  Threshold = c(round(best_thr_tree, 2), round(best_thr_rf, 2)),
+  Test_AUC = c(round(auc_tree, 3), round(auc_rf, 3)),
+  Balanced_Accuracy = c(round(bal_tree, 3), round(bal_rf, 3)),
+  Sensitivity = c(round(sens_tree, 3), round(sens_rf, 3)),
+  Specificity = c(round(spec_tree, 3), round(spec_rf, 3))
+)
+
+print(tree_rf_summary)
+
+# =============================================================================
+# Decision Tree
+
+#
+# The Decision Tree achieved a test AUC of 0.554, which is only slightly
+# above random guessing and is the weakest result among all models tested.
+#
+# The initial tree splits first on Social_Support < 3.0, identifying it
+# as the strongest single predictor. A full tree with 475 terminal nodes
+# was first grown, and cross-validation was then used to select the optimal
+# tree size.
+#
+# The pruning curve shows that the cross-validation error decreases quickly
+# up to 28 terminal nodes and then stabilises. Additional splits beyond
+# this point do not improve predictive performance, suggesting that the
+# dataset does not contain a complex hierarchical structure that deeper
+# trees could exploit.
+#
+# The pruned tree with 28 terminal nodes uses Social_Support in most
+# branches, with Work_Stress_Level, Mood_Swings, and Suicidal_Thoughts
+# appearing at deeper levels.
+#
+# Although the tree is easy to interpret, a single decision tree tends to
+# overfit small patterns in the SMOTE-balanced training data and therefore
+# does not generalise well to the real imbalanced test data.
+#
+# Key results:
+#   Terminal nodes:     28 (after pruning)
+#   Threshold:          0.79
+#   Test AUC:           0.554
+#   Balanced Accuracy:  0.549
+#   Sensitivity:        0.560
+#   Specificity:        0.538
+#
+# Figures:
+#   - Initial Classification Tree
+#   - CV Error vs Tree Size (pruning curve, best = 28)
+#   - Pruned Tree (28 leaves)
+#   - ROC Curve (Test Set, AUC = 0.554)
+#   - Confusion Matrix (Test Set, threshold = 0.79)
+
+
+# =============================================================================
+# Random Forest
+
+
+# The Random Forest achieved a test AUC of 0.603, which is the best result
+# among the Part 2 models. However, it is still below the best models from
+# Part 1, particularly LDA (AUC = 0.644).
+#
+# Tuning the number of predictors used at each split showed that the lowest
+# out-of-bag error occurs when mtry = 3. The error increases as more
+# predictors are considered at each split. This indicates that reducing the
+# number of variables per split helps decorrelate the trees and improves
+# overall performance.
+#
+# The out-of-bag error curve stabilises around 100 trees, indicating that
+# using 350 trees is sufficient for the model to converge.
+#
+# Variable importance results are consistent across both measures.
+# Social_Support, Work_Stress_Level, Mood_Swings, and Anxious_Nervous
+# appear as the most influential predictors. Variables such as
+# Self_Harm_Thoughts, Trauma_History, and Smoking have the lowest
+# importance scores and contribute little to predictive performance.
+#
+# Random Forest improves over a single Decision Tree by +0.049 AUC by
+# averaging the predictions of many trees. This reduces variance without
+# substantially increasing bias. However, the model still does not
+# outperform the linear models, suggesting that the mental health dataset
+# may follow mostly linear decision patterns.
+#
+# Key results:
+#   Best mtry:          3
+#   ntree:              350
+#   Threshold:          0.70
+#   Test AUC:           0.603
+#   Balanced Accuracy:  0.582
+#   Sensitivity:        0.607
+#   Specificity:        0.558
+#
+# Figures:
+#   - OOB Error vs mtry (best mtry = 3)
+#   - OOB Error vs Number of Trees (stabilises around 100)
+#   - Variable Importance (MeanDecreaseAccuracy + MeanDecreaseGini)
+#   - ROC Curve (Test Set, AUC = 0.603)
+#   - Confusion Matrix (Test Set, threshold = 0.70)
 
 
 
+# FINAL RANKING — ALL MODELS 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+#
+#   Model             AUC    Bal.Acc   Sensitivity   Specificity
+#   LDA               0.644  0.614     0.593         0.635
+#   LogReg            0.642  0.612     0.576         0.647
+#   Naive Bayes       0.638  0.615     0.538         0.692
+#   Random Forest     0.603  0.582     0.607         0.558
+#   QDA               0.575  0.602     0.492         0.712
+#   k-NN              0.572  0.530     0.239         0.821
+#   Decision Tree     0.554  0.549     0.560         0.538
