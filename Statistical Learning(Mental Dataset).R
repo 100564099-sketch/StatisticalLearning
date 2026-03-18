@@ -18,7 +18,8 @@ library(randomForest)
 library(purrr)
 library(forcats)
 library(tibble)
-library(tree) 
+library (tree)
+
 
 
 # Load dataset
@@ -807,6 +808,8 @@ library(kernlab)
 library(randomForest)
 library(xgboost)
 library(kknn)
+library(tree)
+library(class)
 
 # Load dataset
 mental = read.csv("mental_health.csv")
@@ -907,7 +910,7 @@ print(data_info)
 # First model k = 3
 set.seed(42)
 
-knn_k3 <- knn(
+knn_k3 <- class::knn(
   train = X_train_num,
   test  = X_val_num,
   cl    = y_train,
@@ -940,12 +943,12 @@ print(cm_k3_table)
 k_values <- 1:30
 bal_acc_k <- numeric(length(k_values))
 
-<<<<<<< Updated upstream
+
 for (i in seq_along(k_values)) {
   
   set.seed(42)
   
-  pred_i <- knn(
+  pred_i <- class::knn(
     train = X_train_num,
     test  = X_val_num,
     cl    = y_train,
@@ -958,7 +961,7 @@ for (i in seq_along(k_values)) {
   spec_i <- as.numeric(cm_i$byClass["Specificity"])
   
   bal_acc_k[i] <- 0.5 * (sens_i + spec_i)
-=======
+}
 #Scaling numeric predictors
 num_cols = names(train_smote)[sapply(train_smote, is.numeric)]
 num_cols = setdiff(num_cols, "Has_Mental_Health_Issue")
@@ -972,7 +975,7 @@ scale_apply = function(df, num_cols, mu, sd) {
   out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
   out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
   out
->>>>>>> Stashed changes
+
 }
 
 best_k <- k_values[which.max(bal_acc_k)]
@@ -1799,3 +1802,63 @@ print(tree_rf_summary)
 #   QDA               0.575  0.602     0.492         0.712
 #   k-NN              0.572  0.530     0.239         0.821
 #   Decision Tree     0.554  0.549     0.560         0.538
+
+#=====================================================
+# Support Vector Machine (SVM) - Radial Basis Function
+#=====================================================
+
+ctrl_ml <- trainControl(
+  method="repeatedcv", 
+  number=5, 
+  classProbs=TRUE, 
+  summaryFunction=twoClassSummary
+)
+
+set.seed(42)
+svm_cv <- train(
+  Has_Mental_Health_Issue ~ ., 
+  data = train_sc, 
+  method = "svmRadial",
+  trControl = ctrl_ml, 
+  tuneLength = 3, 
+  metric = "ROC"
+)
+
+# SVM Threshold Selection
+p_svm_val <- predict(svm_cv, newdata = val_sc, type = "prob")[, "Yes"]
+best_thr_svm_row <- pick_best_thr(mental_val[[target_col]], p_svm_val)
+best_thr_svm <- best_thr_svm_row$threshold
+
+# SVM Test Evaluation
+p_svm_test <- predict(svm_cv, newdata = test_sc, type = "prob")[, "Yes"]
+pred_svm_test <- factor(ifelse(p_svm_test >= best_thr_svm, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_svm <- confusionMatrix(pred_svm_test, y_test, positive = "Yes")
+roc_svm <- roc(y_test, p_svm_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+auc_svm <- as.numeric(auc(roc_svm))
+
+cat("\n--- SVM Results ---\n")
+cat("Test AUC:", round(auc_svm, 3), "| Threshold:", best_thr_svm, "\n")
+print(cm_svm$table)
+
+#====================================================================
+# FINAL ROC PLOT (All Machine Learning Models)
+#====================================================================
+
+roc_list_all <- list(
+  "k-NN" = roc_knn,
+  "Decision Tree" = roc_tree,
+  "Random Forest" = roc_rf,
+  "SVM (Radial)" = roc_svm
+)
+
+auc_vals_all <- sapply(roc_list_all, function(r) as.numeric(auc(r)))
+auc_text_all <- paste0(names(auc_vals_all), ": AUC = ", sprintf("%.3f", auc_vals_all), collapse = "\n")
+
+ggroc(roc_list_all, linewidth = 1) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Final Project: Machine Learning Models ROC Curves", color = "Model") +
+  scale_color_viridis_d(end = 0.9) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  theme(legend.position = "right") +
+  annotate("text", x = 0.45, y = 0.25, label = auc_text_all, hjust = 0, vjust = 0, size = 4)
