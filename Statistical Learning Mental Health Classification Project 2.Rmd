@@ -1686,45 +1686,75 @@ The neural network achieves a test AUC of 0.623, placing it between Bagging (0.6
 The threshold of 0.45 is the most clinically interpretable of all models — close to 0.50, well-calibrated, and producing a balanced sensitivity (0.676) and specificity (0.532). The Balanced Accuracy of 0.604 is the second highest among all models after Random Forest (0.597), confirming that the neural network generalises well despite the SMOTE-induced training distribution shift. The performance gap between validation AUC (0.689) and test AUC (0.623) is present but smaller than in the SVM models, suggesting that the neural network's smooth probability outputs are more robust to the class distribution mismatch.
 
 
-
-# **Final Evaluation & Conclusion**
-
-To asses model generalization, we compare the ROC-AUC curves for all machine learning models on the test set. This comprehensive evaluation allows us to identify which model best captures the complex relationships in the data while effectively handling class imbalance. 
-
+## **Model Comparison and Conclusion**
 ```{r final-roc, echo=FALSE}
-roc_list_all <- list("k-NN" = roc_knn, "Decision Tree" = roc_tree, 
-                     "Random Forest" = roc_rf, "SVM (Radial)" = roc_svm)
+roc_list_all <- list(
+  "k-NN"             = roc_knn,
+  "Decision Tree"    = roc_tree,
+  "Bagging"          = roc_bag,
+  "Random Forest"    = roc_rf,
+  "SVM (Linear)"     = roc_linear_obj,
+  "SVM (Radial)"     = roc_radial_obj,
+  "SVM (Polynomial)" = roc_poly_obj,
+  "Neural Network"   = roc_nn
+)
 
 auc_vals_all <- sapply(roc_list_all, function(r) as.numeric(auc(r)))
-auc_text_all <- paste0(names(auc_vals_all), ": AUC = ", 
+auc_text_all <- paste0(names(auc_vals_all), ": AUC = ",
                        sprintf("%.3f", auc_vals_all), collapse = "\n")
 
 ggroc(roc_list_all, linewidth = 1) +
   theme_minimal(base_size = 14) +
-  labs(title = "Final Evaluation: Machine Learning ROC Comparison", color = "Model") +
-  scale_color_viridis_d(end = 0.9) +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
-  annotate("text", x = 0.50, y = 0.25, label = auc_text_all, hjust = 0, vjust = 0, size = 4)
+  scale_color_viridis_d(end = 0.9) +
+  labs(title    = "Machine Learning Models: ROC Curves (Test Set)",
+       subtitle = "All models evaluated on the same held-out test set",
+       color    = "Model") +
+  theme(legend.position = "right") +
+  annotate("text", x = 0.45, y = 0.05,
+           label = auc_text_all, hjust = 0, vjust = 0, size = 3.5)
+
+print(final_comparison %>% arrange(desc(Test_AUC)))
 ```
 
-**Interpretation of Results:** The Final Evaluation ROC Comparison plot provides the ultimate "big picture" of our machine learning pipeline, directly comparing the discriminative power of all four non-linear models on the strictly held-out test set. The Support Vector Machine (SVM) with an RBF kernel emerges as the clear winner with a ROC-AUC of 0.625, followed closely by the Random Forest at 0.603. Both of these models significantly outperform the Decision Tree (0.554) and k-NN (0.596), which struggled to stay far from the diagonal 0.50 random-guess threshold.
-
-Statistically, the elevation of the SVM and Random Forest curves proves that non-linear ensemble and margin-based methods are required to extract meaningful signals from this complex 21-predictor space. This visualization fulfills the instructor's requirement for methodological rigor and per-model evidence, showing that we successfully moved beyond simple linear assumptions. By documenting the performance of each algorithm side-by-side, we establish a statistical grounding for our final recommendation: that while the 92% class imbalance remains a massive challenge, the SVM provides the most credible clinical insights for identifying mental health issues.
-
-## **Conclusion**
-
-The **Support Vector Machine (SVM)** with an RBF kernel emerged as the best performing model with a **ROC-AUC of 0.68**, demonstrating its ability to capture non-linear relationships in the data. The **Random Forest** also showed strong performance, benefiting from its ensemble nature to reduce variance and improve generalization. The **k-NN** model, while simple and interpretable, struggled with the high dimensionality and class imbalance, resulting in a ROC-AUC close to random guessing. The pruned **Decision Tree** provided valuable insights into key predictors but lacked the robustness needed for accurate classification. 
-
-By employing a rigurous validation methodology, using SMOTE to balance the classes during training, and optimizing decision thresholds based on Balanced Accuracy, we ensured that our evaluation was both fair and clinically relevant. The results highlight the importance of using advanced machine learning techniques to capture complex patterns in mental health data, while also emphasizing the need for careful model selection and tuning to achieve the best performance.
 
 
+### Summary of Results
 
+All eight models were evaluated on the same held-out test set, which reflects the true class distribution of the original data. The table below summarises the key performance metrics.
 
+| Model | Test AUC | Balanced Acc | Sensitivity | Specificity | Threshold |
+|---|---|---|---|---|---|
+| SVM (Linear) | **0.636** | 0.596 | 0.609 | 0.583 | 0.48 |
+| Random Forest | 0.629 | 0.597 | 0.681 | 0.513 | 0.68 |
+| Neural Network | 0.623 | **0.604** | 0.676 | 0.532 | 0.45 |
+| Bagging | 0.615 | 0.567 | 0.556 | 0.577 | 0.73 |
+| SVM (Polynomial) | 0.599 | 0.579 | 0.664 | 0.494 | 0.93 |
+| SVM (Radial) | 0.596 | 0.539 | 0.956 | 0.122 | 0.95 |
+| Decision Tree | 0.586 | 0.581 | 0.533 | 0.628 | 0.81 |
+| k-NN | 0.545 | 0.537 | 0.594 | 0.481 | 0.50 |
 
+### Key Findings
 
+**1. SVM Linear kernel is the best overall model.** With a test AUC of 0.636, it achieves the highest discriminative performance and a well-balanced Sensitivity (0.609) / Specificity (0.583) tradeoff. Its threshold of 0.48 is close to 0.50, suggesting good probability calibration. The linear kernel's simplicity acts as implicit regularisation that prevents the overfitting to SMOTE-balanced training folds observed in more complex kernels.
 
+**2. Non-linear SVM kernels severely overfit to SMOTE.** Radial and Polynomial kernels achieve CV AUC of 0.971 and 0.983 respectively, but collapse to 0.596 and 0.599 on the test set — a gap of over 0.38. The Radial kernel's extreme imbalance (Sensitivity=0.956, Specificity=0.122) confirms that it has learned to predict "Yes" for almost everything, exploiting the artificial balance created by SMOTE rather than learning genuine discriminative patterns. This is the most striking illustration of the CV-to-test gap problem in this analysis.
 
+**3. Ensemble methods outperform single trees.** The progression Decision Tree (0.586) → Bagging (0.615) → Random Forest (0.629) cleanly demonstrates the ensemble learning principle. Each step reduces variance through greater tree diversity: Bagging via averaging, Random Forest via additional predictor subsampling (`mtry=5`). The pruned decision tree with 40 leaves is the most interpretable model, relying on `Social_Support` and `Family_History_Mental_Illness` as primary splits — clinically credible and communicable rules.
 
+**4. Neural Network is competitive and best-calibrated.** The neural network achieves AUC 0.623 and the highest Balanced Accuracy (0.604). Its threshold of 0.45 is the closest to 0.50 among all models, reflecting that binary cross-entropy loss directly optimises probability calibration. The training curves confirm clean learning behaviour with effective early stopping and dropout regularisation.
+
+**5. k-NN performs worst.** Euclidean distance on Likert-scale ordinal predictors is not meaningful, and SMOTE's interpolation of integer-valued variables produces non-integer synthetic observations that further distort the distance space. k-NN is fundamentally unsuited to this dataset.
+
+### General Observations
+
+**All models perform in a narrow AUC range (0.545–0.636).** No single model dominates clearly — the top four models (SVM Linear, Random Forest, Neural Network, Bagging) are separated by only 0.021 AUC points. This suggests that the performance ceiling is largely determined by the dataset itself rather than the choice of model. The features are predominantly Likert-scale self-reported measures with substantial overlap between classes, making clean separation inherently difficult.
+
+**CV-to-test gap is present across all models, but varies by complexity.** Simple models (SVM Linear, Neural Network, Decision Tree) show small gaps between CV and test performance. Complex non-linear models (SVM Radial, SVM Polynomial) show gaps exceeding 0.37 AUC points. This pattern is consistent with overfitting to the SMOTE-balanced training distribution — the more flexible the model, the more it exploits the artificial class balance rather than learning generalisable patterns.
+
+**The majority class drives threshold selection.** Since Yes is the dominant class, all models tend to assign high "Yes" probabilities to most observations. This pushes optimal thresholds above 0.50 for most models — ranging from 0.68 (Random Forest) to 0.95 (SVM Radial). The two models with thresholds closest to 0.50 — Neural Network (0.45) and SVM Linear (0.48) — are also the two best-calibrated models, and notably the ones least affected by the CV-to-test gap.
+
+**`Social_Support` is consistently the most important predictor.** Across the decision tree, bagging, and random forest variable importance plots, `Social_Support` appears as the dominant feature. `Family_History_Mental_Illness`, `Mood_Swings`, and `Feeling_Worthless` also rank highly across multiple models. This consistency across different model families provides convergent evidence that social and psychological support factors are the strongest observable signals of mental health status in this dataset.
 
 
 

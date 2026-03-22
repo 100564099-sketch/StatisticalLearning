@@ -2874,6 +2874,113 @@ cat("All NN objects saved!\n")
 
 
 
+#===========================================================
+#=================== LRP ANALYSIS =========================
+#===========================================================
+
+# LRP (Layer-wise Relevance Propagation) for Neural Network
+# Backpropagates prediction relevance through dense layers
+
+lrp_epsilon <- function(model, x_input, epsilon = 0.01) {
+  
+  w1 <- model$layers[[1]]$get_weights()[[1]]
+  b1 <- model$layers[[1]]$get_weights()[[2]]
+  w2 <- model$layers[[4]]$get_weights()[[1]]
+  b2 <- model$layers[[4]]$get_weights()[[2]]
+  
+  # Forward pass
+  z1  <- x_input %*% w1 + matrix(b1, nrow(x_input), length(b1), byrow = TRUE)
+  a1  <- pmax(z1, 0)  # ReLU
+  z2  <- a1 %*% w2 + matrix(b2, nrow(a1), length(b2), byrow = TRUE)
+  out <- 1 / (1 + exp(-z2))  # sigmoid
+  
+  # LRP backward — Step 1: output relevance
+  R2 <- as.vector(out)  # (n,)
+  
+  # Step 2: hidden layer → output (n x 128)
+  # z2_lrp shape: n x 1
+  z2_eps <- a1 %*% w2  # n x 1
+  z2_eps <- z2_eps + epsilon * ifelse(z2_eps >= 0, 1, -1)
+  z2_eps[z2_eps == 0] <- epsilon
+  
+  # relevance per hidden unit: (n x 128)
+  # each hidden unit j gets: a1[j] * w2[j] / z2_eps * R2
+  R1 <- a1 * matrix(as.vector(w2), nrow(a1), ncol(a1), byrow = TRUE) *
+    matrix(R2 / as.vector(z2_eps), nrow(a1), ncol(a1))
+  
+  # Step 3: input → hidden (n x features)
+  z1_eps <- x_input %*% w1
+  z1_eps <- z1_eps + epsilon * ifelse(z1_eps >= 0, 1, -1)
+  z1_eps[z1_eps == 0] <- epsilon
+  
+  # R1_sum per hidden unit divided by z1_eps, weighted by w1
+  r1_ratio <- R1 / z1_eps  # n x 128
+  R0 <- x_input * (r1_ratio %*% t(w1))  # n x features
+  
+  R0
+}
+
+# Apply LRP to test set sample
+set.seed(42)
+sample_idx <- sample(nrow(test_nn$x), 200)
+x_sample   <- test_nn$x[sample_idx, ]
+
+cat("Running LRP on", nrow(x_sample), "test observations...\n")
+lrp_scores <- lrp_epsilon(nn_final, x_sample)
+cat("Done!\n")
+
+cat("LRP matrix shape:", dim(lrp_scores), "\n")
+
+# Aggregate: mean absolute relevance per feature
+feature_names <- colnames(test_nn$x)
+mean_relevance <- colMeans(abs(lrp_scores))
+
+lrp_df <- data.frame(
+  Feature   = feature_names,
+  Relevance = mean_relevance
+) %>%
+  arrange(desc(Relevance)) %>%
+  slice(1:20)  # top 20
+
+print(lrp_df)
+
+# Plot: Global feature importance via LRP
+ggplot(lrp_df, aes(x = reorder(Feature, Relevance), y = Relevance)) +
+  geom_col(fill = "#e74c3c", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title    = "Neural Network: LRP Feature Relevance",
+    subtitle = "Top 20 features — mean absolute relevance on test set (n=200)",
+    x = NULL, y = "Mean Absolute Relevance"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Plot: LRP heatmap — top 10 features, 50 observations
+top10_features <- lrp_df$Feature[1:10]
+lrp_top10 <- lrp_scores[1:50, top10_features]
+
+lrp_heatmap_df <- as.data.frame(lrp_top10) %>%
+  mutate(obs = 1:50) %>%
+  pivot_longer(cols = -obs, names_to = "Feature", values_to = "Relevance")
+
+ggplot(lrp_heatmap_df, aes(x = Feature, y = factor(obs), fill = Relevance)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "#e74c3c",
+                       midpoint = 0) +
+  labs(
+    title    = "Neural Network: LRP Relevance Heatmap",
+    subtitle = "Top 10 features across 50 test observations",
+    x = NULL, y = "Observation", fill = "Relevance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_blank())
+
+# Save
+saveRDS(lrp_df,     "nn_lrp_importance.rds")
+saveRDS(lrp_scores, "nn_lrp_scores.rds")
+cat("LRP results saved!\n")
+
 
 
 
