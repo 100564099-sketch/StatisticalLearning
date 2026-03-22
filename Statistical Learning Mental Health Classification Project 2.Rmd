@@ -1686,6 +1686,97 @@ The neural network achieves a test AUC of 0.623, placing it between Bagging (0.6
 The threshold of 0.45 is the most clinically interpretable of all models — close to 0.50, well-calibrated, and producing a balanced sensitivity (0.676) and specificity (0.532). The Balanced Accuracy of 0.604 is the second highest among all models after Random Forest (0.597), confirming that the neural network generalises well despite the SMOTE-induced training distribution shift. The performance gap between validation AUC (0.689) and test AUC (0.623) is present but smaller than in the SVM models, suggesting that the neural network's smooth probability outputs are more robust to the class distribution mismatch.
 
 
+### Explainability: Layer-wise Relevance Propagation (LRP)
+
+Neural networks are inherently black-box models — their predictions emerge from complex non-linear transformations across multiple layers, making it difficult to understand which features drive individual decisions. To address this, Layer-wise Relevance Propagation (LRP) was applied to decompose the network's predictions back to input feature contributions.
+
+LRP backpropagates the prediction score through the network layer by layer, redistributing relevance according to each neuron's contribution to the output. The epsilon rule was used to stabilise the decomposition and avoid division by zero. Unlike SHAP — which requires expensive Monte Carlo sampling — LRP is gradient-based and runs in seconds, making it well-suited for neural networks.
+```{r nn-lrp, echo=FALSE}
+lrp_epsilon <- function(model, x_input, epsilon = 0.01) {
+  w1 <- model$layers[[1]]$get_weights()[[1]]
+  b1 <- model$layers[[1]]$get_weights()[[2]]
+  w2 <- model$layers[[4]]$get_weights()[[1]]
+  b2 <- model$layers[[4]]$get_weights()[[2]]
+  
+  z1  <- x_input %*% w1 + matrix(b1, nrow(x_input), length(b1), byrow = TRUE)
+  a1  <- pmax(z1, 0)
+  z2  <- a1 %*% w2 + matrix(b2, nrow(a1), length(b2), byrow = TRUE)
+  out <- 1 / (1 + exp(-z2))
+  
+  R2     <- as.vector(out)
+  z2_eps <- a1 %*% w2
+  z2_eps <- z2_eps + epsilon * ifelse(z2_eps >= 0, 1, -1)
+  z2_eps[z2_eps == 0] <- epsilon
+  
+  R1 <- a1 * matrix(as.vector(w2), nrow(a1), ncol(a1), byrow = TRUE) *
+        matrix(R2 / as.vector(z2_eps), nrow(a1), ncol(a1))
+  
+  z1_eps <- x_input %*% w1
+  z1_eps <- z1_eps + epsilon * ifelse(z1_eps >= 0, 1, -1)
+  z1_eps[z1_eps == 0] <- epsilon
+  
+  R0 <- x_input * ((R1 / z1_eps) %*% t(w1))
+  R0
+}
+
+set.seed(42)
+sample_idx <- sample(nrow(test_nn$x), 200)
+x_sample   <- test_nn$x[sample_idx, ]
+lrp_scores <- lrp_epsilon(nn_final, x_sample)
+
+feature_names  <- colnames(test_nn$x)
+mean_relevance <- colMeans(abs(lrp_scores))
+
+lrp_df <- data.frame(
+  Feature   = feature_names,
+  Relevance = mean_relevance
+) %>%
+  arrange(desc(Relevance)) %>%
+  slice(1:20)
+
+# Global importance plot
+ggplot(lrp_df, aes(x = reorder(Feature, Relevance), y = Relevance)) +
+  geom_col(fill = "#e74c3c", alpha = 0.85) +
+  coord_flip() +
+  labs(title    = "Neural Network: LRP Feature Relevance",
+       subtitle = "Top 20 features — mean absolute relevance on test set (n=200)",
+       x = NULL, y = "Mean Absolute Relevance") +
+  theme_minimal(base_size = 13)
+
+# Heatmap
+top10_features <- lrp_df$Feature[1:10]
+lrp_top10      <- lrp_scores[1:50, top10_features]
+
+lrp_heatmap_df <- as.data.frame(lrp_top10) %>%
+  mutate(obs = 1:50) %>%
+  pivot_longer(cols = -obs, names_to = "Feature", values_to = "Relevance")
+
+ggplot(lrp_heatmap_df, aes(x = Feature, y = factor(obs), fill = Relevance)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "#e74c3c",
+                       midpoint = 0) +
+  labs(title    = "Neural Network: LRP Relevance Heatmap",
+       subtitle = "Top 10 features across 50 test observations",
+       x = NULL, y = "Observation", fill = "Relevance") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_blank())
+```
+
+The LRP analysis reveals which features the neural network relies on most when making predictions. `Suicidal_Thoughts` and `Family_History_Mental_Illness` are the two most relevant features, followed by `Financial_Stress`, `Loneliness`, and `Concentration_Difficulty`. `On_Medication` appears prominently at rank 6 — a feature that did not emerge as strongly in tree-based model importance plots, suggesting the neural network has identified a pattern specific to its learned representation.
+
+Comparing LRP relevance with Random Forest variable importance reveals both consistency and divergence. Both methods agree that `Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness`, and `Social_Support` are important predictors. However, `Social_Support` ranked first in the Random Forest but seventh in LRP, while `Suicidal_Thoughts` — a binary indicator — is dominant in LRP but was not the top predictor in tree-based models. This divergence reflects the different mechanisms: Random Forest importance measures average accuracy gain across splits, while LRP measures the direct contribution of each feature to the final prediction score for each observation.
+
+The heatmap provides the local, observation-level view. Red cells indicate that a feature pushed the prediction towards "Yes" for that observation; blue cells indicate a push towards "No". The heterogeneity across rows confirms that the model does not rely on a fixed set of features for all observations — different combinations of risk factors drive the prediction for different individuals, which is clinically realistic and suggests the model has learned meaningful structure beyond a simple majority-class rule.
+
+
+
+
+
+
+
+
+
 ## **Model Comparison and Conclusion**
 ```{r final-roc, echo=FALSE}
 roc_list_all <- list(
@@ -1716,6 +1807,10 @@ ggroc(roc_list_all, linewidth = 1) +
 
 print(final_comparison %>% arrange(desc(Test_AUC)))
 ```
+
+
+
+
 
 
 
@@ -1754,33 +1849,19 @@ All eight models were evaluated on the same held-out test set, which reflects th
 
 **The majority class drives threshold selection.** Since Yes is the dominant class, all models tend to assign high "Yes" probabilities to most observations. This pushes optimal thresholds above 0.50 for most models — ranging from 0.68 (Random Forest) to 0.95 (SVM Radial). The two models with thresholds closest to 0.50 — Neural Network (0.45) and SVM Linear (0.48) — are also the two best-calibrated models, and notably the ones least affected by the CV-to-test gap.
 
-**`Social_Support` is consistently the most important predictor.** Across the decision tree, bagging, and random forest variable importance plots, `Social_Support` appears as the dominant feature. `Family_History_Mental_Illness`, `Mood_Swings`, and `Feeling_Worthless` also rank highly across multiple models. This consistency across different model families provides convergent evidence that social and psychological support factors are the strongest observable signals of mental health status in this dataset.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+**Feature importance is broadly consistent across model families, with notable divergences.**
+Across the decision tree, bagging, and random forest variable importance plots, `Social_Support` 
+appears as the dominant feature, with `Family_History_Mental_Illness`, `Mood_Swings`, and 
+`Feeling_Worthless` also ranking highly. The LRP analysis of the neural network largely confirms 
+this picture — `Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness`, and 
+`Social_Support` are important across both tree-based and neural network approaches. However, 
+LRP assigns the highest relevance to `Suicidal_Thoughts` and elevates `On_Medication` to rank 6, 
+neither of which dominated the tree-based importance rankings. This divergence reflects the 
+different mechanisms: Random Forest importance captures average accuracy gain across splits at 
+a global level, while LRP measures each feature's direct contribution to individual predictions. 
+The convergence across methods on social and psychological support factors — `Social_Support`, 
+`Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness` — provides the strongest 
+evidence that these are the genuinely informative signals in this dataset.
 
 
 
