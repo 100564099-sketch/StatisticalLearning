@@ -811,6 +811,92 @@ library(kknn)
 library(tree)
 library(class)
 
+# HELPER FUNCTIONS
+# Calculate metrics for a specific threshold
+calc_metrics_bal <- function(y_true, prob_yes, thr) {
+  pred <- factor(ifelse(prob_yes >= thr, "Yes", "No"), levels = c("No","Yes"))
+  cm <- caret::confusionMatrix(pred, y_true, positive = "Yes")
+  
+  acc  <- as.numeric(cm$overall["Accuracy"])
+  sens <- as.numeric(cm$byClass["Sensitivity"])
+  spec <- as.numeric(cm$byClass["Specificity"])
+  bal  <- 0.5 * (sens + spec)
+  
+  prec <- as.numeric(cm$byClass["Pos Pred Value"])
+  f1   <- if (is.na(prec) || is.na(sens) || (prec + sens) == 0) NA_real_ else 2 * prec * sens / (prec + sens)
+  
+  data.frame(threshold = thr, Accuracy = acc, Precision = prec,
+             Sensitivity = sens, Specificity = spec, BalancedAcc = bal, F1 = f1)
+}
+# Threshold picker
+pick_best_thr_bal <- function(y_true, prob_yes) {
+  tbl <- dplyr::bind_rows(lapply(thr_grid, function(t) calc_metrics_bal(y_true, prob_yes, t))) |>
+    dplyr::arrange(dplyr::desc(BalancedAcc), dplyr::desc(Sensitivity), dplyr::desc(Specificity))
+  list(best = tbl[1, ], all = tbl)
+}
+# Threshold selection plot
+plot_threshold_effect_one <- function(tbl_all, model_name, best_thr = NULL) {
+  
+  tbl_long <- tbl_all %>%
+    dplyr::select(threshold, Accuracy, Precision, Sensitivity, Specificity) %>%
+    tidyr::pivot_longer(cols = -threshold, names_to = "Metric", values_to = "Value")
+  
+  p <- ggplot(tbl_long, aes(x = threshold, y = Value, color = Metric)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 1.4) +
+    labs(
+      title = model_name,
+      x = "Probability Threshold",
+      y = "Metric Value"
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank()
+    ) +
+    scale_color_viridis_d(end = 0.9)
+  
+  # optional: best threshold line (from your val_threshold_summary)
+  if (!is.null(best_thr) && is.finite(best_thr)) {
+    p <- p + geom_vline(xintercept = best_thr, linetype = "solid", color = "black", linewidth = 0.6)
+  }
+  p
+}
+# apply SMOTE + scaling for a given feature set
+prepare_data <- function(train, val, test, feature_cols) {
+  
+  keep <- c("Has_Mental_Health_Issue", feature_cols)
+  
+  # Subset to selected features
+  tr <- train[, keep]
+  va <- val[,   keep]
+  te <- test[,  keep]
+  
+  # SMOTE on training set
+  tr_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = tr,
+                    perc.over = 600, perc.under = 100)
+  tr_smote$Has_Mental_Health_Issue <- factor(
+    tr_smote$Has_Mental_Health_Issue, levels = c("No", "Yes")
+  )
+  
+  # Scaling — fit on SMOTE'd train, apply to all
+  num_cols <- setdiff(names(tr_smote)[sapply(tr_smote, is.numeric)],
+                      "Has_Mental_Health_Issue")
+  mu <- colMeans(tr_smote[, num_cols])
+  sd <- apply(tr_smote[, num_cols], 2, sd)
+  sd[sd == 0] <- 1
+  
+  list(
+    train = scale_apply(tr_smote, num_cols, mu, sd),
+    val   = scale_apply(va,       num_cols, mu, sd),
+    test  = scale_apply(te,       num_cols, mu, sd)
+  )
+}
+
+
+
 # Load dataset
 mental = read.csv("mental_health.csv")
 
@@ -842,72 +928,87 @@ idx_val = createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list
 mental_val  = mental_tmp[idx_val, ]
 mental_test = mental_tmp[-idx_val, ]
 
-# We will start the feature selection with forward stepwise selection based on AIC
-
-df_fs = mental_train
-m0_fs = glm(Has_Mental_Health_Issue ~ 1, data = df_fs, family = binomial())
-m_full = glm(Has_Mental_Health_Issue ~ ., data = df_fs, family = binomial())
-
-m_fwd = stepAIC(m0_fs, scope = list(lower = m0_fs, upper = m_full), direction = "forward", trace = FALSE)
-selected_terms = attr(terms(m_fwd), "term.labels")
-
-keep_cols = c("Has_Mental_Health_Issue", selected_terms)
-mental_train = mental_train[, keep_cols, drop = FALSE]
-mental_val   = mental_val[,   keep_cols, drop = FALSE]
-mental_test  = mental_test[,  keep_cols, drop = FALSE]
-
-# SMOTE to handle class imbalance in the training set
-
-# We will apply SMOTE to the training data
-train_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = mental_train, perc.over = 600, perc.under = 100)
-train_smote$Has_Mental_Health_Issue <- factor(train_smote$Has_Mental_Health_Issue, levels = c("No", "Yes"))
-
-#Scaling numeric predictors
-num_cols = names(train_smote)[sapply(train_smote, is.numeric)]
-num_cols = setdiff(num_cols, "Has_Mental_Health_Issue")
-
-mu = sapply(train_smote[, num_cols, drop = FALSE], mean)
-sd = sapply(train_smote[, num_cols, drop = FALSE], sd)
-sd[sd == 0] = 1
-
-scale_apply = function(df, num_cols, mu, sd) {
-  out = df
-  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
-  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
-  out
-}
-
-train_sc = scale_apply(train_smote, num_cols, mu, sd)
-val_sc   = scale_apply(mental_val,   num_cols, mu, sd)
-test_sc  = scale_apply(mental_test,  num_cols, mu, sd)
-
+#===============================
 #===== k-NEAREST NEIGHBOURS=====
+#===============================
 
-# Prepare data
-X_train <- train_sc[, setdiff(names(train_sc), target_col)]
-y_train <- train_sc[[target_col]]
-
-X_val <- val_sc[, setdiff(names(val_sc), target_col)]
-y_val <- val_sc[[target_col]]
-
-X_test <- test_sc[, setdiff(names(test_sc), target_col)]
-y_test <- test_sc[[target_col]]
-
-# Keep numeric variables
-num_feature_cols <- names(X_train)[sapply(X_train, is.numeric)]
-
-X_train_num <- as.matrix(X_train[, num_feature_cols])
-X_val_num   <- as.matrix(X_val[, num_feature_cols])
-X_test_num  <- as.matrix(X_test[, num_feature_cols])
-
-data_info <- data.frame(
-  Item = c("Numeric predictors", "Training rows", "Validation rows", "Test rows"),
-  Value = c(length(num_feature_cols), nrow(X_train_num), nrow(X_val_num), nrow(X_test_num))
+# Step 1: Feature selection using RF on original training data (before SMOTE)
+set.seed(42)
+rf_fs <- randomForest(
+  Has_Mental_Health_Issue ~ .,
+  data       = mental_train,  # original data, not SMOTE'd
+  ntree      = 500,
+  importance = TRUE
 )
 
+# Get importance scores
+imp <- importance(rf_fs, type = 1)  # Mean Decrease Accuracy
+imp_df <- data.frame(
+  Feature    = rownames(imp),
+  Importance = imp[, 1]
+) %>% arrange(desc(Importance))
+
+print(imp_df)
+
+# Plot feature importance
+ggplot(imp_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title    = "Random Forest Feature Importance",
+    subtitle = "Feature selection for k-NN (trained on original data)",
+    x = "", y = "Mean Decrease Accuracy"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Select features above mean importance
+# Only keep features with positive importance above mean of positive values
+positive_imp <- imp_df$Importance[imp_df$Importance > 0]
+
+selected_knn_features <- imp_df$Feature[imp_df$Importance > mean(positive_imp)]
+cat("Selected features for kNN:", length(selected_knn_features), "\n")
+print(selected_knn_features)
+
+# Remove binary (0/1) and categorical variables
+unique_counts <- sapply(mental_train[, selected_knn_features], function(x) length(unique(x)))
+print(sort(unique_counts))
+
+binary_or_cat <- sapply(mental_train[, selected_knn_features], function(x) {
+  length(unique(x)) <= 2 | is.factor(x)
+})
+
+knn_features_final <- selected_knn_features[!binary_or_cat]
+
+cat("Final kNN features (excluding binary & categorical):\n")
+cat("Count:", length(knn_features_final), "\n")
+print(knn_features_final)
+
+# Step 2: SMOTE + Scaling using prepare_data function
+knn_data <- prepare_data(mental_train, mental_val, mental_test, knn_features_final)
+
+train_sc_knn <- knn_data$train
+val_sc_knn   <- knn_data$val
+test_sc_knn  <- knn_data$test
+
+# Step 3: Prepare matrices for class::knn
+target_col       <- "Has_Mental_Health_Issue"
+num_feature_cols <- knn_features_final
+
+X_train_num <- as.matrix(train_sc_knn[, num_feature_cols])
+X_val_num   <- as.matrix(val_sc_knn[,   num_feature_cols])
+X_test_num  <- as.matrix(test_sc_knn[,  num_feature_cols])
+
+y_train <- train_sc_knn[[target_col]]
+y_val   <- val_sc_knn[[target_col]]
+y_test  <- test_sc_knn[[target_col]]
+
+data_info <- data.frame(
+  Item  = c("Numeric predictors", "Training rows", "Validation rows", "Test rows"),
+  Value = c(length(num_feature_cols), nrow(X_train_num), nrow(X_val_num), nrow(X_test_num))
+)
 print(data_info)
 
-# First model k = 3
+# Step 4: Baseline model k = 3
 set.seed(42)
 
 knn_k3 <- class::knn(
@@ -920,8 +1021,8 @@ knn_k3 <- class::knn(
 cm_k3 <- confusionMatrix(knn_k3, y_val, positive = "Yes")
 
 k3_summary <- data.frame(
-  Metric = c("Accuracy","Sensitivity","Specificity","Balanced Accuracy"),
-  Value = c(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced Accuracy"),
+  Value  = c(
     as.numeric(cm_k3$overall["Accuracy"]),
     as.numeric(cm_k3$byClass["Sensitivity"]),
     as.numeric(cm_k3$byClass["Specificity"]),
@@ -931,328 +1032,295 @@ k3_summary <- data.frame(
     )
   )
 )
-
 print(k3_summary)
 
 cm_k3_table <- as.data.frame(cm_k3$table)
-colnames(cm_k3_table) <- c("Prediction","Reference","Count")
-
+colnames(cm_k3_table) <- c("Prediction", "Reference", "Count")
 print(cm_k3_table)
 
-# Tune k
-k_values <- 1:30
-bal_acc_k <- numeric(length(k_values))
-
-
-for (i in seq_along(k_values)) {
-  
-  set.seed(42)
-  
-  pred_i <- class::knn(
-    train = X_train_num,
-    test  = X_val_num,
-    cl    = y_train,
-    k     = k_values[i]
-  )
-  
-  cm_i <- confusionMatrix(pred_i, y_val, positive = "Yes")
-  
-  sens_i <- as.numeric(cm_i$byClass["Sensitivity"])
-  spec_i <- as.numeric(cm_i$byClass["Specificity"])
-  
-  bal_acc_k[i] <- 0.5 * (sens_i + spec_i)
-}
-#Scaling numeric predictors
-num_cols = names(train_smote)[sapply(train_smote, is.numeric)]
-num_cols = setdiff(num_cols, "Has_Mental_Health_Issue")
-
-mu = sapply(train_smote[, num_cols, drop = FALSE], mean)
-sd = sapply(train_smote[, num_cols, drop = FALSE], sd)
-sd[sd == 0] = 1
-
-scale_apply = function(df, num_cols, mu, sd) {
-  out = df
-  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, mu, "-")
-  out[, num_cols] <- sweep(out[, num_cols, drop = FALSE], 2, sd, "/")
-  out
-
-}
-
-best_k <- k_values[which.max(bal_acc_k)]
-
-k_results <- data.frame(
-  k = k_values,
-  Balanced_Accuracy = bal_acc_k
-)
-
-print(k_results)
-
-best_k_table <- data.frame(
-  Measure = c("Best k","Best Balanced Accuracy"),
-  Value = c(best_k, round(max(bal_acc_k),4))
-)
-
-print(best_k_table)
-
-ggplot(k_results, aes(x = k, y = Balanced_Accuracy)) +
-  geom_line(color = "steelblue", linewidth = 1) +
-  geom_point(color = "steelblue", size = 2) +
-  geom_vline(xintercept = best_k, linetype = "dashed", color = "red") +
-  annotate(
-    "text",
-    x = best_k + 0.5,
-    y = min(bal_acc_k) + 0.005,
-    label = paste("k =", best_k),
-    color = "red",
-    hjust = 0
-  ) +
-  labs(
-    title = "k-NN: Balanced Accuracy vs k",
-    subtitle = "Validation set",
-    x = "k",
-    y = "Balanced Accuracy"
-  ) +
-  theme_minimal(base_size = 13)
-
-# Cross validation
-knn_formula <- reformulate(num_feature_cols, response="Has_Mental_Health_Issue")
+# Step 5: Cross-validation to select best k
+knn_formula <- reformulate(num_feature_cols, response = "Has_Mental_Health_Issue")
 
 ctrl_cv <- trainControl(
-  method="repeatedcv",
-  number=5,
-  repeats=3,
-  classProbs=TRUE,
-  summaryFunction=twoClassSummary,
-  savePredictions="final"
+  method          = "repeatedcv",
+  number          = 5,
+  repeats         = 3,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
 )
 
 set.seed(42)
 
 knn_cv <- train(
   knn_formula,
-  data=train_sc,
-  method="knn",
-  trControl=ctrl_cv,
-  tuneGrid=data.frame(k=1:30),
-  metric="ROC"
+  data      = train_sc_knn,
+  method    = "knn",
+  trControl = ctrl_cv,
+  tuneGrid  = data.frame(k = seq(1, 30, by = 2)),
+  metric    = "ROC"
 )
 
-cv_results <- knn_cv$results[,c("k","ROC","Sens","Spec")]
-
+# CV results table
+cv_results <- knn_cv$results[, c("k", "ROC", "Sens", "Spec")]
 print(cv_results)
 
 cv_best <- data.frame(
-  Measure=c("Best k","Best ROC"),
-  Value=c(knn_cv$bestTune$k, round(max(knn_cv$results$ROC),4))
+  Measure = c("Best k", "Best ROC"),
+  Value   = c(knn_cv$bestTune$k, round(max(knn_cv$results$ROC), 4))
 )
-
 print(cv_best)
 
-plot(knn_cv)
+# CV ROC-AUC vs k plot
+ggplot(knn_cv$results, aes(x = k, y = ROC)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_vline(xintercept = knn_cv$bestTune$k, linetype = "dashed", color = "red") +
+  annotate(
+    "text",
+    x     = knn_cv$bestTune$k + 0.5,
+    y     = min(knn_cv$results$ROC) + 0.002,
+    label = paste("k =", knn_cv$bestTune$k),
+    color = "red",
+    hjust = 0
+  ) +
+  labs(
+    title    = "k-NN: ROC-AUC vs k",
+    subtitle = "5-fold repeated CV (3 repeats)",
+    x = "k",
+    y = "ROC-AUC"
+  ) +
+  theme_minimal(base_size = 13)
 
-# Threshold selection
-p_knn_val <- predict(knn_cv,newdata=val_sc,type="prob")[,"Yes"]
+# Step 6: Threshold — default 0.50 (kNN produces coarse probabilities)
+# kNN outputs only k+1 unique probability values, making threshold
+# optimisation unreliable — default 0.50 is used instead.
+best_thr_knn <- 0.50
 
-thr_grid <- seq(0.05,0.95,by=0.01)
-
-calc_metrics_bal <- function(y_true,prob_yes,thr){
-  
-  pred <- factor(
-    ifelse(prob_yes >= thr,"Yes","No"),
-    levels=c("No","Yes")
-  )
-  
-  cm <- confusionMatrix(pred,y_true,positive="Yes")
-  
-  sens <- as.numeric(cm$byClass["Sensitivity"])
-  spec <- as.numeric(cm$byClass["Specificity"])
-  prec <- as.numeric(cm$byClass["Pos Pred Value"])
-  acc  <- as.numeric(cm$overall["Accuracy"])
-  
-  bal <- 0.5*(sens+spec)
-  
-  data.frame(
-    Threshold=thr,
-    Accuracy=acc,
-    Sensitivity=sens,
-    Specificity=spec,
-    Balanced_Accuracy=bal,
-    Precision=prec
-  )
-}
-
-thr_results_knn <- bind_rows(
-  lapply(thr_grid,function(t) calc_metrics_bal(y_val,p_knn_val,t))
-)
-
-best_thr_row <- thr_results_knn %>%
-  arrange(desc(Balanced_Accuracy)) %>%
-  slice(1)
-
-best_thr_knn <- best_thr_row$Threshold
-
-print(best_thr_row)
-
-# Test results
-p_knn_test <- predict(knn_cv,newdata=test_sc,type="prob")[,"Yes"]
+# Step 7: Final evaluation on test set
+p_knn_test <- predict(knn_cv, newdata = test_sc_knn, type = "prob")[, "Yes"]
 
 pred_knn_test <- factor(
-  ifelse(p_knn_test >= best_thr_knn,"Yes","No"),
-  levels=c("No","Yes")
+  ifelse(p_knn_test >= best_thr_knn, "Yes", "No"),
+  levels = c("No", "Yes")
 )
 
-cm_test <- confusionMatrix(pred_knn_test,y_test,positive="Yes")
+cm_test <- confusionMatrix(pred_knn_test, y_test, positive = "Yes")
 
 roc_knn <- roc(
-  y_test,
-  p_knn_test,
-  levels=c("No","Yes"),
-  direction="<",
-  quiet=TRUE
+  y_test, p_knn_test,
+  levels    = c("No", "Yes"),
+  direction = "<",
+  quiet     = TRUE
 )
 
-auc_knn <- as.numeric(auc(roc_knn))
-
+auc_knn   <- as.numeric(auc(roc_knn))
 sens_test <- as.numeric(cm_test$byClass["Sensitivity"])
 spec_test <- as.numeric(cm_test$byClass["Specificity"])
 prec_test <- as.numeric(cm_test$byClass["Pos Pred Value"])
 f1_test   <- as.numeric(cm_test$byClass["F1"])
 acc_test  <- as.numeric(cm_test$overall["Accuracy"])
-
-bal_test <- 0.5*(sens_test+spec_test)
+bal_test  <- 0.5 * (sens_test + spec_test)
 
 knn_test_summary <- data.frame(
-  Model=paste0("kNN (k=",knn_cv$bestTune$k,")"),
-  Test_AUC=round(auc_knn,3),
-  Balanced_Accuracy=round(bal_test,3),
-  Threshold=round(best_thr_knn,2),
-  Accuracy=round(acc_test,3),
-  Sensitivity=round(sens_test,3),
-  Specificity=round(spec_test,3),
-  Precision=round(prec_test,3),
-  F1=round(f1_test,3)
+  Model             = paste0("kNN (k=", knn_cv$bestTune$k, ")"),
+  Test_AUC          = round(auc_knn,  3),
+  Balanced_Accuracy = round(bal_test, 3),
+  Threshold         = round(best_thr_knn, 2),
+  Accuracy          = round(acc_test, 3),
+  Sensitivity       = round(sens_test, 3),
+  Specificity       = round(spec_test, 3),
+  Precision         = round(prec_test, 3),
+  F1                = round(f1_test,  3)
 )
-
 print(knn_test_summary)
 
 cm_test_table <- as.data.frame(cm_test$table)
-colnames(cm_test_table) <- c("Prediction","Reference","Count")
-
+colnames(cm_test_table) <- c("Prediction", "Reference", "Count")
 print(cm_test_table)
 
-# ROC plot
-ggroc(roc_knn,linewidth=1,color="steelblue") +
-  geom_abline(slope=1,intercept=1,linetype="dashed") +
+# ROC curve plot
+ggroc(roc_knn, linewidth = 1, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
   labs(
-    title="k-NN ROC Curve",
-    subtitle=paste("AUC =",round(auc_knn,3)),
-    x="Specificity",
-    y="Sensitivity"
+    title    = "k-NN ROC Curve",
+    subtitle = paste("AUC =", round(auc_knn, 3)),
+    x = "Specificity",
+    y = "Sensitivity"
   ) +
   theme_minimal()
 
 # Confusion matrix plot
 cm_df <- as.data.frame(cm_test$table)
-colnames(cm_df) <- c("Prediction","Reference","Freq")
+colnames(cm_df) <- c("Prediction", "Reference", "Freq")
 
-ggplot(cm_df,aes(x=Reference,y=Prediction,fill=Freq)) +
-  geom_tile(color="white") +
-  geom_text(aes(label=Freq),size=7) +
-  scale_fill_gradient(low="white",high="steelblue") +
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
   labs(
-    title="k-NN Confusion Matrix",
-    x="Actual",
-    y="Predicted"
+    title = "k-NN Confusion Matrix",
+    x = "Actual",
+    y = "Predicted"
   ) +
   theme_minimal()
 
+# Final summary
 knn_summary <- data.frame(
-  Model = c("k-NN"),
-  Main_Setting = c(paste0("k = ", knn_cv$bestTune$k)),
-  Threshold = c(round(best_thr_knn, 2)),
-  Test_AUC = c(round(auc_knn, 3)),
-  Balanced_Accuracy = c(round(bal_test, 3)),
-  Sensitivity = c(round(sens_test, 3)),
-  Specificity = c(round(spec_test, 3))
+  Model             = "k-NN",
+  Main_Setting      = paste0("k = ", knn_cv$bestTune$k),
+  Threshold         = round(best_thr_knn, 2),
+  Test_AUC          = round(auc_knn,  3),
+  Balanced_Accuracy = round(bal_test, 3),
+  Sensitivity       = round(sens_test, 3),
+  Specificity       = round(spec_test, 3)
 )
-
 print(knn_summary)
 
+# Decision boundary plot using top 2 RF features
+top2 <- knn_features_final[1:2]  # Anxious_Nervous, Feel_Understood
+
+# Create grid over 2D feature space
+x_range <- seq(min(train_sc_knn[[top2[1]]]) - 0.5,
+               max(train_sc_knn[[top2[1]]]) + 0.5,
+               length.out = 150)
+y_range <- seq(min(train_sc_knn[[top2[2]]]) - 0.5,
+               max(train_sc_knn[[top2[2]]]) + 0.5,
+               length.out = 150)
+
+grid_df <- expand.grid(setNames(list(x_range, y_range), top2))
+
+# Fill remaining features with their mean from training set
+for (col in setdiff(num_feature_cols, top2)) {
+  grid_df[[col]] <- mean(train_sc_knn[[col]])
+}
+
+# Predict on grid
+grid_pred <- predict(knn_cv, newdata = grid_df, type = "raw")
+grid_df$Predicted <- grid_pred
+
+# Train plot
+p_train <- ggplot() +
+  geom_tile(
+    data  = grid_df,
+    aes(x = .data[[top2[1]]], y = .data[[top2[2]]], fill = Predicted),
+    alpha = 0.2
+  ) +
+  geom_jitter(
+    data   = train_sc_knn,
+    aes(x  = .data[[top2[1]]], y = .data[[top2[2]]], color = Has_Mental_Health_Issue),
+    size   = 1.5, alpha = 0.6, shape = 16,
+    width  = 0.05, height = 0.05
+  ) +
+  scale_fill_manual(values  = c("No" = "#4393c3", "Yes" = "#d6604d")) +
+  scale_color_manual(values = c("No" = "#1a6099", "Yes" = "#b2182b")) +
+  labs(
+    title = "Training Set",
+    x     = top2[1], y = top2[2],
+    fill  = "Predicted", color = "Actual"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# Test plot
+p_test <- ggplot() +
+  geom_tile(
+    data  = grid_df,
+    aes(x = .data[[top2[1]]], y = .data[[top2[2]]], fill = Predicted),
+    alpha = 0.2
+  ) +
+  geom_jitter(
+    data   = test_sc_knn,
+    aes(x  = .data[[top2[1]]], y = .data[[top2[2]]], color = Has_Mental_Health_Issue),
+    size   = 2, alpha = 0.7, shape = 16,
+    width  = 0.05, height = 0.05
+  ) +
+  scale_fill_manual(values  = c("No" = "#4393c3", "Yes" = "#d6604d")) +
+  scale_color_manual(values = c("No" = "#1a6099", "Yes" = "#b2182b")) +
+  labs(
+    title = "Test Set",
+    x     = top2[1], y = top2[2],
+    fill  = "Predicted", color = "Actual"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# Combine
+p_train + p_test +
+  plot_annotation(
+    title    = "k-NN Decision Boundary",
+    subtitle = paste0("Top 2 features: ", top2[1], " vs ", top2[2],
+                      " | k = ", knn_cv$bestTune$k,
+                      " | Other features fixed at training mean",
+                      " | Jitter applied for discrete Likert values")
+  )
 #==============================================================================
-# k-Nearest Neighbours 
+# k-Nearest Neighbours
 #
-# The k-NN model performed worst among the tested models, achieving a
-# test AUC of 0.572, which is only slightly above random guessing (0.5).
-# This is lower than the best model from Part 1 (LDA, AUC = 0.644).
+# FEATURE SELECTION
+# k-NN requires a separate feature selection step because it relies on
+# Euclidean distance rather than model coefficients. Random Forest importance
+# (Mean Decrease Accuracy) was used, as it captures non-linear relationships
+# and ranks features by their contribution to predictive accuracy — more
+# appropriate for a distance-based method. Features with negative or
+# near-zero importance were excluded, and binary/categorical variables were
+# removed since Euclidean distance is not meaningful for 0/1 values.
+# This left 8 Likert-scale predictors.
 #
-# The weak performance is mainly due to two reasons. First, with 21
-# predictors, the differences between observations become less useful,
-# which reduces the effectiveness of nearest-neighbors methods.
-# Second, the class imbalance in the data affects how k-NN identifies
-# similar points in the neighborhood.
+# CLASS IMBALANCE
+# SMOTE was applied to balance the training set before scaling. Note that
+# SMOTE interpolates between existing observations to generate synthetic
+# minority class samples. For Likert-scale variables (e.g. 1-10), this
+# produces non-integer values (e.g. 3.7) that do not exist in the original
+# data. This distorts the distance space that k-NN relies on, and is a
+# known limitation of applying SMOTE to ordinal data.
 #
-# The large gap between the cross-validation ROC (0.924) and the test
-# performance occurs because cross-validation was performed on training
-# data balanced with SMOTE, while the test set reflects the true class
-# distribution.
+# THRESHOLD SELECTION
+# k-NN probability estimates are inherently coarse: with k neighbours,
+# only k+1 distinct probability values are possible (0/k, 1/k, ..., k/k).
+# With k=5, this means only 6 unique probability values exist on the
+# validation set, making threshold optimisation unreliable. The default
+# threshold of 0.50 was retained.
 #
-# Overall, k-NN does not perform well for this problem. Linear models
-# such as LDA and Logistic Regression perform better because they use
-# patterns from the whole dataset rather than relying only on nearby
-# observations.
-
+# MODEL SELECTION OF k
+# k was selected via 5-fold repeated cross-validation (3 repeats) using
+# ROC-AUC as the tuning metric, consistent with the imbalanced class setting.
+# The optimal k=5 achieved a CV ROC of 0.926. However, this inflated
+# CV performance reflects the balanced SMOTE training set, not the true
+# class distribution in the test set.
+#
+# TEST PERFORMANCE
+# The large gap between CV ROC (0.926) and test AUC (0.545) confirms that
+# the model does not generalise well. The test set reflects the true class
+# distribution (majority = Yes), while CV was evaluated on SMOTE-balanced
+# folds. This gap is a direct consequence of SMOTE inflating CV performance.
+# The ROC curve on the test set is nearly diagonal, indicating the model
+# performs only marginally better than random guessing.
+#
+# WHY k-NN IS UNSUITABLE FOR THIS DATASET
+# 1. Ordinal/Likert predictors: All 8 features are Likert scales (1-10).
+#    Euclidean distance treats these as continuous, but the intervals are
+#    not guaranteed to be equal. This undermines the distance metric that
+#    k-NN relies on.
+# 2. Curse of dimensionality: With 8 features, distance-based methods
+#    begin to lose discriminative power as observations become equidistant.
+# 3. No parametric structure: k-NN cannot exploit global patterns in the
+#    data. It relies only on local neighbourhoods, which are less reliable
+#    in high-dimensional ordinal spaces.
+#
 # Key results:
-#   Best k:             5 (cross-validation)
-#   Threshold:          0.81
-#   Test AUC:           0.572
-#   Balanced Accuracy:  0.530
-#   Sensitivity:        0.239
-#   Specificity:        0.821
-# ==============================================================================
+#   Feature selection:  RF importance (8 Likert-scale predictors)
+#   Best k:             5 (5-fold repeated CV, ROC metric)
+#   Threshold:          0.50 (default — coarse probability output)
+#   CV ROC:             0.926 (on SMOTE-balanced training folds)
+#   Test AUC:           0.545
+#   Balanced Accuracy:  0.537
+#   Sensitivity:        0.594
+#   Specificity:        0.481
+#==============================================================================
 
-# Threshold helper
 
-calc_metrics_bal <- function(y_true, prob_yes, thr) {
-  pred <- factor(
-    ifelse(prob_yes >= thr, "Yes", "No"),
-    levels = c("No", "Yes")
-  )
-  
-  cm <- caret::confusionMatrix(pred, y_true, positive = "Yes")
-  
-  sens <- as.numeric(cm$byClass["Sensitivity"])
-  spec <- as.numeric(cm$byClass["Specificity"])
-  bal  <- 0.5 * (sens + spec)
-  prec <- as.numeric(cm$byClass["Pos Pred Value"])
-  
-  f1 <- if (is.na(prec) || is.na(sens) || (prec + sens) == 0) {
-    NA_real_
-  } else {
-    2 * prec * sens / (prec + sens)
-  }
-  
-  data.frame(
-    threshold = thr,
-    Sensitivity = sens,
-    Specificity = spec,
-    BalancedAcc = bal,
-    Precision = prec,
-    F1 = f1,
-    Accuracy = as.numeric(cm$overall["Accuracy"])
-  )
-}
 
-pick_best_thr <- function(y_true, prob_yes) {
-  thr_grid <- seq(0.05, 0.95, by = 0.01)
-  
-  tbl <- dplyr::bind_rows(
-    lapply(thr_grid, function(t) calc_metrics_bal(y_true, prob_yes, t))
-  )
-  
-  tbl %>%
-    arrange(desc(BalancedAcc), desc(Sensitivity), desc(Specificity)) %>%
-    slice(1)
-}
 
 # Initial decision tree
 
