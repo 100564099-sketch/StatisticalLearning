@@ -865,11 +865,10 @@ plot_threshold_effect_one <- function(tbl_all, model_name, best_thr = NULL) {
   p
 }
 # apply SMOTE + scaling for a given feature set
-prepare_data <- function(train, val, test, feature_cols) {
+prepare_data <- function(train, val, test, feature_cols, scale = TRUE) {
   
   keep <- c("Has_Mental_Health_Issue", feature_cols)
   
-  # Subset to selected features
   tr <- train[, keep]
   va <- val[,   keep]
   te <- test[,  keep]
@@ -881,20 +880,24 @@ prepare_data <- function(train, val, test, feature_cols) {
     tr_smote$Has_Mental_Health_Issue, levels = c("No", "Yes")
   )
   
-  # Scaling — fit on SMOTE'd train, apply to all
-  num_cols <- setdiff(names(tr_smote)[sapply(tr_smote, is.numeric)],
-                      "Has_Mental_Health_Issue")
-  mu <- colMeans(tr_smote[, num_cols])
-  sd <- apply(tr_smote[, num_cols], 2, sd)
-  sd[sd == 0] <- 1
-  
-  list(
-    train = scale_apply(tr_smote, num_cols, mu, sd),
-    val   = scale_apply(va,       num_cols, mu, sd),
-    test  = scale_apply(te,       num_cols, mu, sd)
-  )
+  if (scale) {
+    # Scaling — fit on SMOTE'd train, apply to all
+    num_cols <- setdiff(names(tr_smote)[sapply(tr_smote, is.numeric)],
+                        "Has_Mental_Health_Issue")
+    mu <- colMeans(tr_smote[, num_cols])
+    sd <- apply(tr_smote[, num_cols], 2, sd)
+    sd[sd == 0] <- 1
+    
+    list(
+      train = scale_apply(tr_smote, num_cols, mu, sd),
+      val   = scale_apply(va,       num_cols, mu, sd),
+      test  = scale_apply(te,       num_cols, mu, sd)
+    )
+  } else {
+    # No scaling — return SMOTE'd data as is
+    list(train = tr_smote, val = va, test = te)
+  }
 }
-
 
 
 # Load dataset
@@ -928,9 +931,9 @@ idx_val = createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list
 mental_val  = mental_tmp[idx_val, ]
 mental_test = mental_tmp[-idx_val, ]
 
-#===============================
-#===== k-NEAREST NEIGHBOURS=====
-#===============================
+#===========================================================
+#================== k-NEAREST NEIGHBOURS ===================
+#===========================================================
 
 # Step 1: Feature selection using RF on original training data (before SMOTE)
 set.seed(42)
@@ -984,7 +987,7 @@ cat("Count:", length(knn_features_final), "\n")
 print(knn_features_final)
 
 # Step 2: SMOTE + Scaling using prepare_data function
-knn_data <- prepare_data(mental_train, mental_val, mental_test, knn_features_final)
+knn_data <- prepare_data(mental_train, mental_val, mental_test, knn_features_final, scale = TRUE)
 
 train_sc_knn <- knn_data$train
 val_sc_knn   <- knn_data$val
@@ -1320,76 +1323,125 @@ p_train + p_test +
 #==============================================================================
 
 
+#===========================================================
+#========================= DECISION TREE ===================
+#===========================================================
 
+# Prepare data — all features, SMOTE + scaling via prepare_data
+all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
+tree_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = FALSE)
 
-# Initial decision tree
+train_sc_tree <- tree_data$train
+val_sc_tree   <- tree_data$val
+test_sc_tree  <- tree_data$test
 
-set.seed(42)
-mental_tree_init <- tree(
-  Has_Mental_Health_Issue ~ .,
-  data = train_smote,
-  control = tree.control(
-    nobs = nrow(train_smote),
-    mindev = 0.01,
-    minsize = 10
+y_val_tree  <- val_sc_tree$Has_Mental_Health_Issue
+y_test_tree <- test_sc_tree$Has_Mental_Health_Issue
+
+# Step 1: Hyperparameter grid search (mindev + minsize) via CV
+mindev_grid  <- c(0.001, 0.005, 0.01, 0.02)
+minsize_grid <- c(5, 10, 20, 30)
+
+hp_grid <- expand.grid(mindev = mindev_grid, minsize = minsize_grid)
+
+cv_hp_results <- map_dfr(seq_len(nrow(hp_grid)), function(i) {
+  
+  mindev_i  <- hp_grid$mindev[i]
+  minsize_i <- hp_grid$minsize[i]
+  
+  set.seed(42)
+  tree_i <- tree(
+    Has_Mental_Health_Issue ~ .,
+    data    = train_sc_tree,
+    control = tree.control(
+      nobs    = nrow(train_sc_tree),
+      mindev  = mindev_i,
+      minsize = minsize_i
+    )
   )
-)
+  
+  # CV to find best pruned size for this combination
+  cv_i <- cv.tree(tree_i, FUN = prune.misclass, K = 5)
+  
+  best_size_i <- min(cv_i$size[cv_i$dev == min(cv_i$dev)])
+  
+  # Prune and evaluate on validation set
+  pruned_i <- prune.misclass(tree_i, best = best_size_i)
+  
+  prob_val_i <- predict(pruned_i, newdata = val_sc_tree, type = "vector")[, "Yes"]
+  
+  roc_i  <- roc(y_val_tree, prob_val_i, levels = c("No", "Yes"),
+                direction = "<", quiet = TRUE)
+  auc_i  <- as.numeric(auc(roc_i))
+  
+  thr_row <- pick_best_thr_bal(y_val_tree, prob_val_i)$best
+  bal_i   <- thr_row$BalancedAcc
+  
+  tibble(
+    mindev    = mindev_i,
+    minsize   = minsize_i,
+    best_size = best_size_i,
+    Val_AUC   = round(auc_i, 4),
+    Val_BalancedAcc = round(bal_i, 4)
+  )
+})
 
-tree_init_summary <- data.frame(
-  Measure = c("Tree type", "mindev", "minsize"),
-  Value = c("Initial decision tree", 0.01, 10)
-)
+print(cv_hp_results)
 
-print(tree_init_summary)
-print(summary(mental_tree_init))
+# Best hyperparameter combination (by Val AUC)
+best_hp <- cv_hp_results %>% arrange(desc(Val_AUC)) %>% slice(1)
+print(best_hp)
 
-plot(mental_tree_init)
-text(mental_tree_init, pretty = 0, cex = 0.75)
-title("Mental Health: Initial Classification Tree")
+best_mindev  <- best_hp$mindev
+best_minsize <- best_hp$minsize
 
-# Full tree and pruning
+# Since minsize has no effect, simplify plot to show only mindev
+ggplot(cv_hp_results %>% distinct(mindev, .keep_all = TRUE),
+       aes(x = factor(mindev), y = Val_AUC, group = 1)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  labs(
+    title    = "Decision Tree: Hyperparameter Grid Search",
+    subtitle = "effect of mindev on validation AUC",
+    x = "mindev",
+    y = "Validation AUC"
+  ) +
+  theme_minimal(base_size = 13)
 
+
+# Step 2: Grow full tree with best hyperparameters
 set.seed(42)
 mental_tree_full <- tree(
   Has_Mental_Health_Issue ~ .,
-  data = train_smote,
+  data    = train_sc_tree,
   control = tree.control(
-    nobs = nrow(train_smote),
-    mindev = 0,
-    minsize = 2
+    nobs    = nrow(train_sc_tree),
+    mindev  = best_mindev,
+    minsize = best_minsize
   )
 )
 
-full_tree_info <- data.frame(
-  Measure = c("Tree type", "Terminal nodes"),
-  Value = c(
-    "Full unpruned tree",
-    mental_tree_full$frame %>% filter(var == "<leaf>") %>% nrow()
-  )
-)
+cat("Full tree terminal nodes:", sum(mental_tree_full$frame$var == "<leaf>"), "\n")
 
-print(full_tree_info)
-
+# Step 3: CV pruning to select best size
 set.seed(42)
-mental_cv <- cv.tree(mental_tree_full, FUN = prune.misclass)
+mental_cv <- cv.tree(mental_tree_full, FUN = prune.misclass, K = 5)
 
 cv_results_tree <- data.frame(
-  size = mental_cv$size,
+  size     = mental_cv$size,
   cv_error = mental_cv$dev
 )
-
 print(cv_results_tree)
 
-min_dev <- min(mental_cv$dev, na.rm = TRUE)
-best_size <- min(mental_cv$size[mental_cv$dev == min_dev], na.rm = TRUE)
+best_size <- min(mental_cv$size[mental_cv$dev == min(mental_cv$dev)])
 
 best_size_table <- data.frame(
   Measure = c("Minimum CV error", "Best tree size"),
-  Value = c(min_dev, best_size)
+  Value   = c(min(mental_cv$dev), best_size)
 )
-
 print(best_size_table)
 
+# CV error vs tree size plot
 tibble(size = mental_cv$size, cv_error = mental_cv$dev) %>%
   ggplot(aes(x = size, y = cv_error)) +
   geom_line(color = "steelblue", linewidth = 1) +
@@ -1397,99 +1449,88 @@ tibble(size = mental_cv$size, cv_error = mental_cv$dev) %>%
   geom_vline(xintercept = best_size, linetype = "dashed", color = "red") +
   annotate(
     "text",
-    x = best_size + 0.3,
-    y = max(mental_cv$dev) * 0.98,
+    x     = best_size + 0.3,
+    y     = max(mental_cv$dev) * 0.98,
     label = paste("best =", best_size),
-    color = "red",
-    hjust = 0
+    color = "red", hjust = 0
   ) +
   labs(
-    title = "Decision Tree: CV Error vs Tree Size",
+    title    = "Decision Tree: CV Error vs Tree Size",
     subtitle = paste("Best size =", best_size),
     x = "Number of terminal nodes",
     y = "CV misclassification count"
   ) +
   theme_minimal(base_size = 13)
 
+# Step 4: Pruned tree
 mental_tree_pruned <- prune.misclass(mental_tree_full, best = best_size)
 
 plot(mental_tree_pruned)
 text(mental_tree_pruned, pretty = 0, cex = 0.8)
-title(paste("Mental Health: Pruned Tree (", best_size, " leaves)"))
+title(paste("Mental Health: Pruned Tree (", best_size, "leaves)"))
 
-# Tree threshold selection
+# Step 5: Threshold selection on validation set
+p_tree_val <- predict(mental_tree_pruned, newdata = val_sc_tree,
+                      type = "vector")[, "Yes"]
 
-tree_prob_val <- predict(mental_tree_pruned, newdata = mental_val, type = "vector")
-p_tree_val <- as.numeric(tree_prob_val[, "Yes"])
-
-best_thr_tree_row <- pick_best_thr(mental_val[[target_col]], p_tree_val)
-best_thr_tree <- best_thr_tree_row$threshold
+best_thr_tree_row <- pick_best_thr_bal(y_val_tree, p_tree_val)$best
+best_thr_tree     <- best_thr_tree_row$threshold
 
 print(best_thr_tree_row)
 
-# Tree test evaluation
+# Threshold effect plot
+all_thr_tree <- pick_best_thr_bal(y_val_tree, p_tree_val)$all
+plot_threshold_effect_one(all_thr_tree, "Decision Tree", best_thr_tree)
 
-tree_prob_test <- predict(mental_tree_pruned, newdata = mental_test, type = "vector")
-p_tree_test <- as.numeric(tree_prob_test[, "Yes"])
+# Step 6: Final evaluation on test set
+p_tree_test <- predict(mental_tree_pruned, newdata = test_sc_tree,
+                       type = "vector")[, "Yes"]
 
 pred_tree_test <- factor(
   ifelse(p_tree_test >= best_thr_tree, "Yes", "No"),
   levels = c("No", "Yes")
 )
 
-y_test <- mental_test[[target_col]]
-cm_tree <- confusionMatrix(pred_tree_test, y_test, positive = "Yes")
-roc_tree <- roc(y_test, p_tree_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+cm_tree  <- confusionMatrix(pred_tree_test, y_test_tree, positive = "Yes")
+roc_tree <- roc(y_test_tree, p_tree_test, levels = c("No", "Yes"),
+                direction = "<", quiet = TRUE)
 auc_tree <- as.numeric(auc(roc_tree))
 
 sens_tree <- as.numeric(cm_tree$byClass["Sensitivity"])
 spec_tree <- as.numeric(cm_tree$byClass["Specificity"])
-bal_tree <- 0.5 * (sens_tree + spec_tree)
-acc_tree <- as.numeric(cm_tree$overall["Accuracy"])
-f1_tree <- as.numeric(cm_tree$byClass["F1"])
+bal_tree  <- 0.5 * (sens_tree + spec_tree)
+acc_tree  <- as.numeric(cm_tree$overall["Accuracy"])
+f1_tree   <- as.numeric(cm_tree$byClass["F1"])
+prec_tree <- as.numeric(cm_tree$byClass["Pos Pred Value"])
 
-tree_test_info <- data.frame(
-  Measure = c("Best tree size", "Threshold", "Test AUC"),
-  Value = c(best_size, best_thr_tree, round(auc_tree, 4))
+tree_test_summary <- data.frame(
+  Model             = paste0("Decision Tree (", best_size, " leaves)"),
+  Test_AUC          = round(auc_tree,  3),
+  Balanced_Accuracy = round(bal_tree,  3),
+  Threshold         = round(best_thr_tree, 2),
+  Accuracy          = round(acc_tree,  3),
+  Sensitivity       = round(sens_tree, 3),
+  Specificity       = round(spec_tree, 3),
+  Precision         = round(prec_tree, 3),
+  F1                = round(f1_tree,   3)
 )
+print(tree_test_summary)
 
-print(tree_test_info)
-print(cm_tree)
+cm_tree_table <- as.data.frame(cm_tree$table)
+colnames(cm_tree_table) <- c("Prediction", "Reference", "Count")
+print(cm_tree_table)
 
-metrics_tree <- tibble(
-  Model = paste0("Decision Tree (", best_size, " leaves)"),
-  Test_AUC = round(auc_tree, 3),
-  Test_BalancedAcc = round(bal_tree, 3),
-  Threshold = best_thr_tree,
-  Test_Sensitivity = round(sens_tree, 3),
-  Test_Specificity = round(spec_tree, 3),
-  Test_Accuracy = round(acc_tree, 3),
-  Test_F1 = round(f1_tree, 3)
-)
-
-print(metrics_tree)
-
+# ROC curve
 ggroc(roc_tree, linewidth = 1, color = "steelblue") +
-  theme_minimal(base_size = 14) +
-  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
   labs(
-    title = "Decision Tree ROC Curve",
-    subtitle = paste0(
-      "AUC = ", round(auc_tree, 3),
-      " | Size = ", best_size,
-      " | Threshold = ", best_thr_tree
-    )
+    title    = "Decision Tree ROC Curve",
+    subtitle = paste("AUC =", round(auc_tree, 3)),
+    x = "Specificity", y = "Sensitivity"
   ) +
-  annotate(
-    "text",
-    x = 0.4,
-    y = 0.15,
-    label = paste0("AUC = ", round(auc_tree, 3)),
-    size = 5,
-    color = "steelblue"
-  ) +
-  theme(plot.title = element_text(face = "bold"))
+  theme_minimal()
 
+# Confusion matrix plot
 cm_tree_df <- as.data.frame(cm_tree$table)
 colnames(cm_tree_df) <- c("Prediction", "Reference", "Freq")
 
@@ -1499,242 +1540,549 @@ ggplot(cm_tree_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   scale_fill_gradient(low = "white", high = "steelblue") +
   labs(
     title = paste0("Decision Tree Confusion Matrix (thr = ", best_thr_tree, ")"),
-    x = "Actual",
-    y = "Predicted"
+    x = "Actual", y = "Predicted"
   ) +
   theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold"),
-    legend.position = "none"
-  )
+  theme(legend.position = "none")
 
-# Bagging
+# Final summary
+tree_summary <- data.frame(
+  Model             = "Decision Tree",
+  Main_Setting      = paste0(best_size, " leaves | mindev=", best_mindev,
+                             " | minsize=", best_minsize),
+  Threshold         = round(best_thr_tree, 2),
+  Test_AUC          = round(auc_tree,  3),
+  Balanced_Accuracy = round(bal_tree,  3),
+  Sensitivity       = round(sens_tree, 3),
+  Specificity       = round(spec_tree, 3)
+)
+print(tree_summary)
 
-p <- ncol(train_smote) - 1
 
+
+
+
+#===========================================================
+#========================= BAGGING =========================
+#===========================================================
+
+# Same unscaled data as decision tree
+train_bag_data <- train_sc_tree
+val_bag_data   <- val_sc_tree
+test_bag_data  <- test_sc_tree
+
+y_val_bag  <- val_bag_data$Has_Mental_Health_Issue
+y_test_bag <- test_bag_data$Has_Mental_Health_Issue
+
+p <- ncol(train_bag_data) - 1  # number of predictors
+
+# Step 1: Find stable ntree via OOB error plot
 set.seed(42)
-mental_bag <- randomForest(
+mental_bag_ntree <- randomForest(
   Has_Mental_Health_Issue ~ .,
-  data = train_smote,
-  mtry = p,
-  ntree = 350,
+  data      = train_bag_data,
+  mtry      = p,  # bagging = all predictors at each split
+  ntree     = 500,
   importance = TRUE
 )
 
-bagging_info <- data.frame(
-  Measure = c("Model", "mtry", "ntree"),
-  Value = c("Bagging", p, 350)
+oob_df_bag <- tibble(
+  Trees     = seq_len(nrow(mental_bag_ntree$err.rate)),
+  OOB_Error = mental_bag_ntree$err.rate[, "OOB"]
 )
 
-print(bagging_info)
-print(mental_bag)
+ggplot(oob_df_bag, aes(x = Trees, y = OOB_Error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  labs(
+    title    = "Bagging: OOB Error vs Number of Trees",
+    subtitle = "Used to determine stable ntree",
+    x = "Number of Trees", y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
 
-bag_prob_val <- predict(mental_bag, newdata = mental_val, type = "prob")[, "Yes"]
-best_thr_bag_row <- pick_best_thr(mental_val[[target_col]], bag_prob_val)
+# Identify stable ntree — first tree where OOB stabilises
+oob_min <- min(oob_df_bag$OOB_Error)
+ntree_stable <- which(oob_df_bag$OOB_Error <= oob_min * 1.01)[1]
+cat("Stable ntree:", ntree_stable, "\n")
 
-bag_validation <- data.frame(
-  Measure = c("Best threshold", "Validation Balanced Accuracy"),
-  Value = c(best_thr_bag_row$threshold, round(best_thr_bag_row$BalancedAcc, 4))
-)
+# Step 2: nodesize grid search via OOB error
+nodesize_grid <- c(1, 5, 10, 20, 30)
 
-print(bag_validation)
-
-# Random forest mtry tuning
-
-base_mtry <- max(1, floor(sqrt(p)))
-mtry_grid <- sort(unique(pmax(1, pmin(p, c(base_mtry - 1, base_mtry, base_mtry + 1, floor(p / 3), p)))))
-
-mtry_grid_table <- data.frame(
-  mtry = mtry_grid
-)
-
-print(mtry_grid_table)
-
-rf_tuning <- map_dfr(mtry_grid, function(m) {
-  set.seed(42 + m)
-  
+nodesize_results <- map_dfr(nodesize_grid, function(ns) {
+  set.seed(42)
   fit <- randomForest(
     Has_Mental_Health_Issue ~ .,
-    data = train_smote,
-    mtry = m,
-    ntree = 250
+    data      = train_bag_data,
+    mtry      = p,
+    ntree     = ntree_stable,
+    nodesize  = ns
   )
-  
   tibble(
-    mtry = m,
-    OOB_Error = fit$err.rate[250, "OOB"]
+    nodesize  = ns,
+    OOB_Error = fit$err.rate[ntree_stable, "OOB"]
   )
 })
 
-best_mtry <- rf_tuning$mtry[which.min(rf_tuning$OOB_Error)]
+print(nodesize_results)
 
-print(rf_tuning)
+best_nodesize_bag <- nodesize_results$nodesize[which.min(nodesize_results$OOB_Error)]
 
-best_mtry_table <- data.frame(
-  Measure = c("Best mtry", "Minimum OOB error"),
-  Value = c(best_mtry, min(rf_tuning$OOB_Error))
-)
+cat("Best nodesize:", best_nodesize_bag, "\n")
 
-print(best_mtry_table)
-
-ggplot(rf_tuning, aes(x = mtry, y = OOB_Error)) +
-  geom_line(color = "#41ab5d", linewidth = 1) +
-  geom_point(color = "#41ab5d", size = 3) +
-  geom_vline(xintercept = best_mtry, linetype = "dashed", color = "red") +
-  annotate(
-    "text",
-    x = best_mtry + 0.2,
-    y = max(rf_tuning$OOB_Error),
-    label = paste("best mtry =", best_mtry),
-    color = "red",
-    hjust = 0
-  ) +
+ggplot(nodesize_results, aes(x = nodesize, y = OOB_Error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_vline(xintercept = best_nodesize_bag, linetype = "dashed", color = "red") +
+  annotate("text", x = best_nodesize_bag + 0.5, y = max(nodesize_results$OOB_Error),
+           label = paste("best =", best_nodesize_bag), color = "red", hjust = 0) +
   labs(
-    title = "Random Forest: OOB Error vs mtry",
-    x = "mtry",
-    y = "OOB Error"
+    title    = "Bagging: OOB Error vs nodesize",
+    subtitle = "Regularisation via minimum terminal node size",
+    x = "nodesize", y = "OOB Error"
   ) +
   theme_minimal(base_size = 13)
 
-# Final random forest
+# Step 3: maxnodes grid search via OOB error
+maxnodes_grid <- list(10, 20, 50, 100, 200, NULL)
 
+maxnodes_results <- map_dfr(seq_along(maxnodes_grid), function(i) {
+  mn <- maxnodes_grid[[i]]
+  set.seed(42)
+  fit <- if (is.null(mn)) {
+    randomForest(
+      Has_Mental_Health_Issue ~ .,
+      data     = train_bag_data,
+      mtry     = p,
+      ntree    = ntree_stable,
+      nodesize = best_nodesize_bag
+    )
+  } else {
+    randomForest(
+      Has_Mental_Health_Issue ~ .,
+      data     = train_bag_data,
+      mtry     = p,
+      ntree    = ntree_stable,
+      nodesize = best_nodesize_bag,
+      maxnodes = mn
+    )
+  }
+  tibble(
+    maxnodes  = ifelse(is.null(mn), Inf, mn),
+    OOB_Error = fit$err.rate[ntree_stable, "OOB"]
+  )
+})
+
+print(maxnodes_results)
+
+best_maxnodes_bag <- maxnodes_results$maxnodes[which.min(maxnodes_results$OOB_Error)]
+cat("Best maxnodes:", best_maxnodes_bag, "\n")
+
+ggplot(maxnodes_results, aes(x = maxnodes, y = OOB_Error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_vline(xintercept = best_maxnodes_bag, linetype = "dashed", color = "red") +
+  labs(
+    title    = "Bagging: OOB Error vs maxnodes",
+    subtitle = "Regularisation via maximum number of terminal nodes",
+    x = "maxnodes", y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Step 4: Final bagging model
 set.seed(42)
-mental_rf <- randomForest(
+mental_bag <- if (is.infinite(best_maxnodes_bag)) {
+  randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data      = train_bag_data,
+    mtry      = p,
+    ntree     = ntree_stable,
+    nodesize  = best_nodesize_bag,
+    importance = TRUE
+  )
+} else {
+  randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data      = train_bag_data,
+    mtry      = p,
+    ntree     = ntree_stable,
+    nodesize  = best_nodesize_bag,
+    maxnodes  = best_maxnodes_bag,
+    importance = TRUE
+  )
+}
+
+print(mental_bag)
+
+bag_info <- data.frame(
+  Measure = c("Model", "mtry (= p)", "ntree", "nodesize", "maxnodes"),
+  Value   = c("Bagging", p, ntree_stable, best_nodesize_bag,
+              ifelse(is.infinite(best_maxnodes_bag), "unrestricted", best_maxnodes_bag))
+)
+print(bag_info)
+
+# Variable importance
+varImpPlot(mental_bag, main = "Bagging: Variable Importance", cex = 0.8)
+
+# Step 5: Threshold selection on validation set
+p_bag_val <- predict(mental_bag, newdata = val_bag_data, type = "prob")[, "Yes"]
+
+best_thr_bag_row <- pick_best_thr_bal(y_val_bag, p_bag_val)$best
+best_thr_bag     <- best_thr_bag_row$threshold
+
+print(best_thr_bag_row)
+
+all_thr_bag <- pick_best_thr_bal(y_val_bag, p_bag_val)$all
+plot_threshold_effect_one(all_thr_bag, "Bagging", best_thr_bag)
+
+# Step 6: Final evaluation on test set
+p_bag_test <- predict(mental_bag, newdata = test_bag_data, type = "prob")[, "Yes"]
+
+pred_bag_test <- factor(
+  ifelse(p_bag_test >= best_thr_bag, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+cm_bag  <- confusionMatrix(pred_bag_test, y_test_bag, positive = "Yes")
+roc_bag <- roc(y_test_bag, p_bag_test, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE)
+auc_bag <- as.numeric(auc(roc_bag))
+
+sens_bag <- as.numeric(cm_bag$byClass["Sensitivity"])
+spec_bag <- as.numeric(cm_bag$byClass["Specificity"])
+bal_bag  <- 0.5 * (sens_bag + spec_bag)
+acc_bag  <- as.numeric(cm_bag$overall["Accuracy"])
+f1_bag   <- as.numeric(cm_bag$byClass["F1"])
+prec_bag <- as.numeric(cm_bag$byClass["Pos Pred Value"])
+
+bag_test_summary <- data.frame(
+  Model             = paste0("Bagging (ntree=", ntree_stable, ")"),
+  Test_AUC          = round(auc_bag,  3),
+  Balanced_Accuracy = round(bal_bag,  3),
+  Threshold         = round(best_thr_bag, 2),
+  Accuracy          = round(acc_bag,  3),
+  Sensitivity       = round(sens_bag, 3),
+  Specificity       = round(spec_bag, 3),
+  Precision         = round(prec_bag, 3),
+  F1                = round(f1_bag,   3)
+)
+print(bag_test_summary)
+
+cm_bag_table <- as.data.frame(cm_bag$table)
+colnames(cm_bag_table) <- c("Prediction", "Reference", "Count")
+print(cm_bag_table)
+
+# ROC curve
+ggroc(roc_bag, linewidth = 1, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+  labs(
+    title    = "Bagging ROC Curve",
+    subtitle = paste("AUC =", round(auc_bag, 3)),
+    x = "Specificity", y = "Sensitivity"
+  ) +
+  theme_minimal()
+
+# Confusion matrix
+cm_bag_df <- as.data.frame(cm_bag$table)
+colnames(cm_bag_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_bag_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = paste0("Bagging Confusion Matrix (thr = ", best_thr_bag, ")"),
+    x = "Actual", y = "Predicted"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# Final summary
+bag_summary <- data.frame(
+  Model             = "Bagging",
+  Main_Setting      = paste0("mtry=p | ntree=", ntree_stable,
+                             " | nodesize=", best_nodesize_bag,
+                             " | maxnodes=", ifelse(is.infinite(best_maxnodes_bag),
+                                                    "unrestricted", best_maxnodes_bag)),
+  Threshold         = round(best_thr_bag, 2),
+  Test_AUC          = round(auc_bag,  3),
+  Balanced_Accuracy = round(bal_bag,  3),
+  Sensitivity       = round(sens_bag, 3),
+  Specificity       = round(spec_bag, 3)
+)
+print(bag_summary)
+
+
+
+
+#===========================================================
+#========================= RANDOM FOREST ===================
+#===========================================================
+
+# Same unscaled data as decision tree and bagging
+train_rf_data <- train_sc_tree
+val_rf_data   <- val_sc_tree
+test_rf_data  <- test_sc_tree
+
+y_val_rf  <- val_rf_data$Has_Mental_Health_Issue
+y_test_rf <- test_rf_data$Has_Mental_Health_Issue
+
+p <- ncol(train_rf_data) - 1  # number of predictors
+
+# Step 1: Find stable ntree via OOB error plot
+set.seed(42)
+mental_rf_ntree <- randomForest(
   Has_Mental_Health_Issue ~ .,
-  data = train_smote,
-  mtry = best_mtry,
-  ntree = 350,
+  data      = train_rf_data,
+  mtry      = floor(sqrt(p)),  # default RF mtry
+  ntree     = 500,
   importance = TRUE
 )
 
-rf_info <- data.frame(
-  Measure = c("Model", "Best mtry", "ntree"),
-  Value = c("Random Forest", best_mtry, 350)
+oob_df_rf <- tibble(
+  Trees     = seq_len(nrow(mental_rf_ntree$err.rate)),
+  OOB_Error = mental_rf_ntree$err.rate[, "OOB"]
 )
 
-print(rf_info)
-print(mental_rf)
-
-oob_df <- tibble(
-  Trees = seq_len(nrow(mental_rf$err.rate)),
-  OOB_Error = mental_rf$err.rate[, "OOB"]
-)
-
-ggplot(oob_df, aes(x = Trees, y = OOB_Error)) +
-  geom_line(color = "#2c7fb8", linewidth = 1) +
+ggplot(oob_df_rf, aes(x = Trees, y = OOB_Error)) +
+  geom_line(color = "#41ab5d", linewidth = 1) +
   labs(
-    title = "Random Forest: OOB Error vs Number of Trees",
-    subtitle = "Stabilises before ntree = 350",
-    x = "Number of Trees",
-    y = "OOB Error"
+    title    = "Random Forest: OOB Error vs Number of Trees",
+    subtitle = "Used to determine stable ntree",
+    x = "Number of Trees", y = "OOB Error"
   ) +
   theme_minimal(base_size = 13)
 
-# Variable importance
+oob_min_rf    <- min(oob_df_rf$OOB_Error)
+ntree_stable_rf <- which(oob_df_rf$OOB_Error <= oob_min_rf * 1.01)[1]
+cat("Stable ntree:", ntree_stable_rf, "\n")
 
-varImpPlot(
-  mental_rf,
-  main = "Mental Health RF Variable Importance",
-  cex = 0.8
+# Step 2: mtry grid search via OOB error
+base_mtry  <- floor(sqrt(p))
+mtry_grid  <- sort(unique(pmax(1, pmin(p, c(
+  base_mtry - 2, base_mtry - 1, base_mtry,
+  base_mtry + 1, base_mtry + 2,
+  floor(p / 3), floor(p / 2)
+)))))
+
+mtry_results <- map_dfr(mtry_grid, function(m) {
+  set.seed(42)
+  fit <- randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data  = train_rf_data,
+    mtry  = m,
+    ntree = ntree_stable_rf
+  )
+  tibble(mtry = m, OOB_Error = fit$err.rate[ntree_stable_rf, "OOB"])
+})
+
+print(mtry_results)
+best_mtry_rf <- mtry_results$mtry[which.min(mtry_results$OOB_Error)]
+cat("Best mtry:", best_mtry_rf, "\n")
+
+ggplot(mtry_results, aes(x = mtry, y = OOB_Error)) +
+  geom_line(color = "#41ab5d", linewidth = 1) +
+  geom_point(color = "#41ab5d", size = 2.5) +
+  geom_vline(xintercept = best_mtry_rf, linetype = "dashed", color = "red") +
+  annotate("text", x = best_mtry_rf + 0.3, y = max(mtry_results$OOB_Error),
+           label = paste("best =", best_mtry_rf), color = "red", hjust = 0) +
+  labs(
+    title    = "Random Forest: OOB Error vs mtry",
+    subtitle = "Number of predictors sampled at each split",
+    x = "mtry", y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Step 3: nodesize grid search via OOB error
+nodesize_grid_rf <- c(1, 5, 10, 20, 30)
+
+nodesize_results_rf <- map_dfr(nodesize_grid_rf, function(ns) {
+  set.seed(42)
+  fit <- randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data     = train_rf_data,
+    mtry     = best_mtry_rf,
+    ntree    = ntree_stable_rf,
+    nodesize = ns
+  )
+  tibble(nodesize = ns, OOB_Error = fit$err.rate[ntree_stable_rf, "OOB"])
+})
+
+print(nodesize_results_rf)
+best_nodesize_rf <- nodesize_results_rf$nodesize[which.min(nodesize_results_rf$OOB_Error)]
+cat("Best nodesize:", best_nodesize_rf, "\n")
+
+ggplot(nodesize_results_rf, aes(x = nodesize, y = OOB_Error)) +
+  geom_line(color = "#41ab5d", linewidth = 1) +
+  geom_point(color = "#41ab5d", size = 2.5) +
+  geom_vline(xintercept = best_nodesize_rf, linetype = "dashed", color = "red") +
+  annotate("text", x = best_nodesize_rf + 0.5, y = max(nodesize_results_rf$OOB_Error),
+           label = paste("best =", best_nodesize_rf), color = "red", hjust = 0) +
+  labs(
+    title    = "Random Forest: OOB Error vs nodesize",
+    subtitle = "Regularisation via minimum terminal node size",
+    x = "nodesize", y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Step 4: maxnodes grid search via OOB error
+maxnodes_grid_rf <- list(10, 20, 50, 100, 200, NULL)
+
+maxnodes_results_rf <- map_dfr(seq_along(maxnodes_grid_rf), function(i) {
+  mn <- maxnodes_grid_rf[[i]]
+  set.seed(42)
+  fit <- if (is.null(mn)) {
+    randomForest(
+      Has_Mental_Health_Issue ~ .,
+      data     = train_rf_data,
+      mtry     = best_mtry_rf,
+      ntree    = ntree_stable_rf,
+      nodesize = best_nodesize_rf
+    )
+  } else {
+    randomForest(
+      Has_Mental_Health_Issue ~ .,
+      data     = train_rf_data,
+      mtry     = best_mtry_rf,
+      ntree    = ntree_stable_rf,
+      nodesize = best_nodesize_rf,
+      maxnodes = mn
+    )
+  }
+  tibble(
+    maxnodes  = ifelse(is.null(mn), Inf, mn),
+    OOB_Error = fit$err.rate[ntree_stable_rf, "OOB"]
+  )
+})
+
+print(maxnodes_results_rf)
+best_maxnodes_rf <- maxnodes_results_rf$maxnodes[which.min(maxnodes_results_rf$OOB_Error)]
+cat("Best maxnodes:", best_maxnodes_rf, "\n")
+
+ggplot(maxnodes_results_rf, aes(x = maxnodes, y = OOB_Error)) +
+  geom_line(color = "#41ab5d", linewidth = 1) +
+  geom_point(color = "#41ab5d", size = 2.5) +
+  geom_vline(xintercept = best_maxnodes_rf, linetype = "dashed", color = "red") +
+  labs(
+    title    = "Random Forest: OOB Error vs maxnodes",
+    subtitle = "Regularisation via maximum number of terminal nodes",
+    x = "maxnodes", y = "OOB Error"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Step 5: Final RF model
+set.seed(42)
+mental_rf <- if (is.infinite(best_maxnodes_rf)) {
+  randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data      = train_rf_data,
+    mtry      = best_mtry_rf,
+    ntree     = ntree_stable_rf,
+    nodesize  = best_nodesize_rf,
+    importance = TRUE
+  )
+} else {
+  randomForest(
+    Has_Mental_Health_Issue ~ .,
+    data      = train_rf_data,
+    mtry      = best_mtry_rf,
+    ntree     = ntree_stable_rf,
+    nodesize  = best_nodesize_rf,
+    maxnodes  = best_maxnodes_rf,
+    importance = TRUE
+  )
+}
+
+print(mental_rf)
+
+rf_info <- data.frame(
+  Measure = c("Model", "mtry", "ntree", "nodesize", "maxnodes"),
+  Value   = c("Random Forest", best_mtry_rf, ntree_stable_rf, best_nodesize_rf,
+              ifelse(is.infinite(best_maxnodes_rf), "unrestricted", best_maxnodes_rf))
 )
+print(rf_info)
 
-imp_df <- as.data.frame(importance(mental_rf))
-imp_df$Variable <- rownames(imp_df)
+# Variable importance
+varImpPlot(mental_rf, main = "Random Forest: Variable Importance", cex = 0.8)
 
-imp_cols <- intersect(c("MeanDecreaseAccuracy", "MeanDecreaseGini"), names(imp_df))
+imp_df_rf <- as.data.frame(importance(mental_rf))
+imp_df_rf$Variable <- rownames(imp_df_rf)
 
-imp_long <- imp_df %>%
-  select(Variable, all_of(imp_cols)) %>%
+imp_long_rf <- imp_df_rf %>%
+  select(Variable, MeanDecreaseAccuracy, MeanDecreaseGini) %>%
   pivot_longer(cols = -Variable, names_to = "Measure", values_to = "Importance")
 
-ggplot(
-  imp_long,
-  aes(x = fct_reorder(Variable, Importance), y = Importance, fill = Measure)
-) +
+ggplot(imp_long_rf,
+       aes(x = fct_reorder(Variable, Importance), y = Importance, fill = Measure)) +
   geom_col(position = "dodge", alpha = 0.85) +
   coord_flip() +
   facet_wrap(~ Measure, scales = "free_x") +
   labs(
-    title = "Random Forest Variable Importance",
-    x = NULL,
-    y = "Importance"
+    title = "Random Forest: Variable Importance",
+    x = NULL, y = "Importance"
   ) +
   scale_fill_viridis_d() +
   theme_minimal(base_size = 12) +
-  theme(
-    legend.position = "none",
-    plot.title = element_text(face = "bold")
-  )
+  theme(legend.position = "none")
 
-# RF threshold selection
+# Step 6: Threshold selection on validation set
+p_rf_val <- predict(mental_rf, newdata = val_rf_data, type = "prob")[, "Yes"]
 
-rf_prob_val <- predict(mental_rf, newdata = mental_val, type = "prob")[, "Yes"]
-best_thr_rf_row <- pick_best_thr(mental_val[[target_col]], rf_prob_val)
-best_thr_rf <- best_thr_rf_row$threshold
+best_thr_rf_row <- pick_best_thr_bal(y_val_rf, p_rf_val)$best
+best_thr_rf     <- best_thr_rf_row$threshold
 
 print(best_thr_rf_row)
 
-# RF test evaluation
+all_thr_rf <- pick_best_thr_bal(y_val_rf, p_rf_val)$all
+plot_threshold_effect_one(all_thr_rf, "Random Forest", best_thr_rf)
 
-rf_prob_test <- predict(mental_rf, newdata = mental_test, type = "prob")[, "Yes"]
+# Step 7: Final evaluation on test set
+p_rf_test <- predict(mental_rf, newdata = test_rf_data, type = "prob")[, "Yes"]
 
 pred_rf_test <- factor(
-  ifelse(rf_prob_test >= best_thr_rf, "Yes", "No"),
+  ifelse(p_rf_test >= best_thr_rf, "Yes", "No"),
   levels = c("No", "Yes")
 )
 
-cm_rf <- confusionMatrix(pred_rf_test, y_test, positive = "Yes")
-roc_rf <- roc(y_test, rf_prob_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+cm_rf  <- confusionMatrix(pred_rf_test, y_test_rf, positive = "Yes")
+roc_rf <- roc(y_test_rf, p_rf_test, levels = c("No", "Yes"),
+              direction = "<", quiet = TRUE)
 auc_rf <- as.numeric(auc(roc_rf))
 
 sens_rf <- as.numeric(cm_rf$byClass["Sensitivity"])
 spec_rf <- as.numeric(cm_rf$byClass["Specificity"])
-bal_rf <- 0.5 * (sens_rf + spec_rf)
-acc_rf <- as.numeric(cm_rf$overall["Accuracy"])
-f1_rf <- as.numeric(cm_rf$byClass["F1"])
+bal_rf  <- 0.5 * (sens_rf + spec_rf)
+acc_rf  <- as.numeric(cm_rf$overall["Accuracy"])
+f1_rf   <- as.numeric(cm_rf$byClass["F1"])
+prec_rf <- as.numeric(cm_rf$byClass["Pos Pred Value"])
 
-rf_test_info <- data.frame(
-  Measure = c("Best mtry", "ntree", "Threshold", "Test AUC"),
-  Value = c(best_mtry, 350, best_thr_rf, round(auc_rf, 4))
+rf_test_summary <- data.frame(
+  Model             = paste0("Random Forest (mtry=", best_mtry_rf, ")"),
+  Test_AUC          = round(auc_rf,  3),
+  Balanced_Accuracy = round(bal_rf,  3),
+  Threshold         = round(best_thr_rf, 2),
+  Accuracy          = round(acc_rf,  3),
+  Sensitivity       = round(sens_rf, 3),
+  Specificity       = round(spec_rf, 3),
+  Precision         = round(prec_rf, 3),
+  F1                = round(f1_rf,   3)
 )
+print(rf_test_summary)
 
-print(rf_test_info)
-print(cm_rf)
+cm_rf_table <- as.data.frame(cm_rf$table)
+colnames(cm_rf_table) <- c("Prediction", "Reference", "Count")
+print(cm_rf_table)
 
-metrics_rf <- tibble(
-  Model = paste0("Random Forest (mtry=", best_mtry, ")"),
-  Test_AUC = round(auc_rf, 3),
-  Test_BalancedAcc = round(bal_rf, 3),
-  Threshold = best_thr_rf,
-  Test_Sensitivity = round(sens_rf, 3),
-  Test_Specificity = round(spec_rf, 3),
-  Test_Accuracy = round(acc_rf, 3),
-  Test_F1 = round(f1_rf, 3)
-)
-
-print(metrics_rf)
-
+# ROC curve
 ggroc(roc_rf, linewidth = 1, color = "#41ab5d") +
-  theme_minimal(base_size = 14) +
-  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
   labs(
-    title = "Random Forest ROC Curve",
-    subtitle = paste0(
-      "AUC = ", round(auc_rf, 3),
-      " | mtry = ", best_mtry,
-      " | Threshold = ", best_thr_rf
-    )
+    title    = "Random Forest ROC Curve",
+    subtitle = paste("AUC =", round(auc_rf, 3)),
+    x = "Specificity", y = "Sensitivity"
   ) +
-  annotate(
-    "text",
-    x = 0.4,
-    y = 0.15,
-    label = paste0("AUC = ", round(auc_rf, 3)),
-    size = 5,
-    color = "#41ab5d"
-  ) +
-  theme(plot.title = element_text(face = "bold"))
+  theme_minimal()
 
+# Confusion matrix
 cm_rf_df <- as.data.frame(cm_rf$table)
 colnames(cm_rf_df) <- c("Prediction", "Reference", "Freq")
 
@@ -1744,31 +2092,30 @@ ggplot(cm_rf_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   scale_fill_gradient(low = "white", high = "#41ab5d") +
   labs(
     title = paste0("Random Forest Confusion Matrix (thr = ", best_thr_rf, ")"),
-    x = "Actual",
-    y = "Predicted"
+    x = "Actual", y = "Predicted"
   ) +
   theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold"),
-    legend.position = "none"
-  )
+  theme(legend.position = "none")
 
-# Tree and RF summary
-
-tree_rf_summary <- data.frame(
-  Model = c("Decision Tree", "Random Forest"),
-  Main_Setting = c(
-    paste0(best_size, " leaves"),
-    paste0("mtry = ", best_mtry)
-  ),
-  Threshold = c(round(best_thr_tree, 2), round(best_thr_rf, 2)),
-  Test_AUC = c(round(auc_tree, 3), round(auc_rf, 3)),
-  Balanced_Accuracy = c(round(bal_tree, 3), round(bal_rf, 3)),
-  Sensitivity = c(round(sens_tree, 3), round(sens_rf, 3)),
-  Specificity = c(round(spec_tree, 3), round(spec_rf, 3))
+# Final summary
+rf_summary <- data.frame(
+  Model             = "Random Forest",
+  Main_Setting      = paste0("mtry=", best_mtry_rf,
+                             " | ntree=", ntree_stable_rf,
+                             " | nodesize=", best_nodesize_rf,
+                             " | maxnodes=", ifelse(is.infinite(best_maxnodes_rf),
+                                                    "unrestricted", best_maxnodes_rf)),
+  Threshold         = round(best_thr_rf, 2),
+  Test_AUC          = round(auc_rf,  3),
+  Balanced_Accuracy = round(bal_rf,  3),
+  Sensitivity       = round(sens_rf, 3),
+  Specificity       = round(spec_rf, 3)
 )
+print(rf_summary)
 
-print(tree_rf_summary)
+
+
+
 
 # =============================================================================
 # Decision Tree
@@ -1871,43 +2218,329 @@ print(tree_rf_summary)
 #   k-NN              0.572  0.530     0.239         0.821
 #   Decision Tree     0.554  0.549     0.560         0.538
 
-#=====================================================
-# Support Vector Machine (SVM) - Radial Basis Function
-#=====================================================
 
-ctrl_ml <- trainControl(
-  method="repeatedcv", 
-  number=5, 
-  classProbs=TRUE, 
-  summaryFunction=twoClassSummary
+
+
+
+
+#===========================================================
+#========================= SVM =============================
+#===========================================================
+
+# SVM requires scaling — use prepare_data with scale = TRUE
+all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
+svm_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = TRUE)
+
+train_sc_svm <- svm_data$train
+val_sc_svm   <- svm_data$val
+test_sc_svm  <- svm_data$test
+
+y_val_svm  <- val_sc_svm$Has_Mental_Health_Issue
+y_test_svm <- test_sc_svm$Has_Mental_Health_Issue
+
+# CV control — 5-fold, ROC metric
+ctrl_svm <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+#--- 1. Linear Kernel (baseline) ---
+# Only C to tune
+grid_linear <- expand.grid(C = c(0.01, 0.1, 1, 10))
+
+set.seed(42)
+svm_linear <- train(
+  Has_Mental_Health_Issue ~ .,
+  data      = train_sc_svm,
+  method    = "svmLinear",
+  trControl = ctrl_svm,
+  tuneGrid  = grid_linear,
+  metric    = "ROC"
+)
+
+linear_results <- svm_linear$results[, c("C", "ROC", "Sens", "Spec")]
+print(linear_results)
+
+best_linear <- data.frame(
+  Measure = c("Best C", "Best CV ROC"),
+  Value   = c(svm_linear$bestTune$C, round(max(svm_linear$results$ROC), 4))
+)
+print(best_linear)
+
+ggplot(svm_linear$results, aes(x = C, y = ROC)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_vline(xintercept = svm_linear$bestTune$C,
+             linetype = "dashed", color = "red") +
+  scale_x_log10() +
+  labs(
+    title    = "SVM Linear Kernel: CV ROC vs C",
+    subtitle = "5-fold cross-validation",
+    x = "C (log scale)", y = "CV ROC-AUC"
+  ) +
+  theme_minimal(base_size = 13)
+
+#--- 2. Radial Kernel ---
+# C and sigma (gamma) to tune
+grid_radial <- expand.grid(
+  C     = c(0.1, 1, 10),
+  sigma = c(0.01, 0.1, 1)
 )
 
 set.seed(42)
-svm_cv <- train(
-  Has_Mental_Health_Issue ~ ., 
-  data = train_sc, 
-  method = "svmRadial",
-  trControl = ctrl_ml, 
-  tuneLength = 3, 
-  metric = "ROC"
+svm_radial <- train(
+  Has_Mental_Health_Issue ~ .,
+  data      = train_sc_svm,
+  method    = "svmRadial",
+  trControl = ctrl_svm,
+  tuneGrid  = grid_radial,
+  metric    = "ROC"
 )
 
-# SVM Threshold Selection
-p_svm_val <- predict(svm_cv, newdata = val_sc, type = "prob")[, "Yes"]
-best_thr_svm_row <- pick_best_thr(mental_val[[target_col]], p_svm_val)
-best_thr_svm <- best_thr_svm_row$threshold
+radial_results <- svm_radial$results[, c("C", "sigma", "ROC", "Sens", "Spec")]
+print(radial_results)
 
-# SVM Test Evaluation
-p_svm_test <- predict(svm_cv, newdata = test_sc, type = "prob")[, "Yes"]
-pred_svm_test <- factor(ifelse(p_svm_test >= best_thr_svm, "Yes", "No"), levels = c("No", "Yes"))
+best_radial <- data.frame(
+  Measure = c("Best C", "Best sigma", "Best CV ROC"),
+  Value   = c(svm_radial$bestTune$C,
+              svm_radial$bestTune$sigma,
+              round(max(svm_radial$results$ROC), 4))
+)
+print(best_radial)
 
-cm_svm <- confusionMatrix(pred_svm_test, y_test, positive = "Yes")
-roc_svm <- roc(y_test, p_svm_test, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+ggplot(svm_radial$results,
+       aes(x = C, y = ROC, color = factor(sigma), group = factor(sigma))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_log10() +
+  labs(
+    title    = "SVM Radial Kernel: CV ROC vs C",
+    subtitle = "5-fold cross-validation",
+    x = "C (log scale)", y = "CV ROC-AUC",
+    color = "sigma"
+  ) +
+  theme_minimal(base_size = 13)
+
+#--- 3. Polynomial Kernel ---
+# C and degree to tune
+grid_poly <- expand.grid(
+  C      = c(0.1, 1, 10),
+  degree = c(2, 3, 4),
+  scale  = 1  # fixed
+)
+
+set.seed(42)
+svm_poly <- train(
+  Has_Mental_Health_Issue ~ .,
+  data      = train_sc_svm,
+  method    = "svmPoly",
+  trControl = ctrl_svm,
+  tuneGrid  = grid_poly,
+  metric    = "ROC"
+)
+
+poly_results <- svm_poly$results[, c("C", "degree", "ROC", "Sens", "Spec")]
+print(poly_results)
+
+best_poly <- data.frame(
+  Measure = c("Best C", "Best degree", "Best CV ROC"),
+  Value   = c(svm_poly$bestTune$C,
+              svm_poly$bestTune$degree,
+              round(max(svm_poly$results$ROC), 4))
+)
+print(best_poly)
+
+ggplot(svm_poly$results,
+       aes(x = C, y = ROC, color = factor(degree), group = factor(degree))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_log10() +
+  labs(
+    title    = "SVM Polynomial Kernel: CV ROC vs C",
+    subtitle = "5-fold cross-validation",
+    x = "C (log scale)", y = "CV ROC-AUC",
+    color = "degree"
+  ) +
+  theme_minimal(base_size = 13)
+
+#--- 4. Kernel comparison ---
+kernel_comparison <- data.frame(
+  Kernel   = c("Linear", "Radial", "Polynomial"),
+  Best_C   = c(svm_linear$bestTune$C,
+               svm_radial$bestTune$C,
+               svm_poly$bestTune$C),
+  Best_ROC = c(round(max(svm_linear$results$ROC), 4),
+               round(max(svm_radial$results$ROC), 4),
+               round(max(svm_poly$results$ROC), 4))
+)
+print(kernel_comparison)
+
+# Select best kernel
+best_kernel_row <- kernel_comparison %>% arrange(desc(Best_ROC)) %>% slice(1)
+best_kernel_name <- best_kernel_row$Kernel
+cat("Best kernel:", best_kernel_name, "\n")
+
+best_svm <- switch(best_kernel_name,
+                   "Linear"     = svm_linear,
+                   "Radial"     = svm_radial,
+                   "Polynomial" = svm_poly
+)
+
+# Step 5: Threshold selection on validation set
+p_svm_val <- predict(best_svm, newdata = val_sc_svm, type = "prob")[, "Yes"]
+
+best_thr_svm_row <- pick_best_thr_bal(y_val_svm, p_svm_val)$best
+best_thr_svm     <- best_thr_svm_row$threshold
+
+print(best_thr_svm_row)
+
+all_thr_svm <- pick_best_thr_bal(y_val_svm, p_svm_val)$all
+plot_threshold_effect_one(all_thr_svm, paste("SVM -", best_kernel_name, "Kernel"), best_thr_svm)
+
+# Step 6: Final evaluation on test set
+p_svm_test <- predict(best_svm, newdata = test_sc_svm, type = "prob")[, "Yes"]
+
+pred_svm_test <- factor(
+  ifelse(p_svm_test >= best_thr_svm, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+cm_svm  <- confusionMatrix(pred_svm_test, y_test_svm, positive = "Yes")
+roc_svm <- roc(y_test_svm, p_svm_test, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE)
 auc_svm <- as.numeric(auc(roc_svm))
 
-cat("\n--- SVM Results ---\n")
-cat("Test AUC:", round(auc_svm, 3), "| Threshold:", best_thr_svm, "\n")
-print(cm_svm$table)
+sens_svm <- as.numeric(cm_svm$byClass["Sensitivity"])
+spec_svm <- as.numeric(cm_svm$byClass["Specificity"])
+bal_svm  <- 0.5 * (sens_svm + spec_svm)
+acc_svm  <- as.numeric(cm_svm$overall["Accuracy"])
+f1_svm   <- as.numeric(cm_svm$byClass["F1"])
+prec_svm <- as.numeric(cm_svm$byClass["Pos Pred Value"])
+
+svm_test_summary <- data.frame(
+  Model             = paste0("SVM (", best_kernel_name, " kernel)"),
+  Test_AUC          = round(auc_svm,  3),
+  Balanced_Accuracy = round(bal_svm,  3),
+  Threshold         = round(best_thr_svm, 2),
+  Accuracy          = round(acc_svm,  3),
+  Sensitivity       = round(sens_svm, 3),
+  Specificity       = round(spec_svm, 3),
+  Precision         = round(prec_svm, 3),
+  F1                = round(f1_svm,   3)
+)
+print(svm_test_summary)
+
+cm_svm_table <- as.data.frame(cm_svm$table)
+colnames(cm_svm_table) <- c("Prediction", "Reference", "Count")
+print(cm_svm_table)
+
+# ROC curve
+ggroc(roc_svm, linewidth = 1, color = "purple") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+  labs(
+    title    = paste("SVM ROC Curve -", best_kernel_name, "Kernel"),
+    subtitle = paste("AUC =", round(auc_svm, 3)),
+    x = "Specificity", y = "Sensitivity"
+  ) +
+  theme_minimal()
+
+# Confusion matrix
+cm_svm_df <- as.data.frame(cm_svm$table)
+colnames(cm_svm_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_svm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "purple") +
+  labs(
+    title = paste0("SVM Confusion Matrix - ", best_kernel_name,
+                   " Kernel (thr = ", best_thr_svm, ")"),
+    x = "Actual", y = "Predicted"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# Final summary
+svm_summary <- data.frame(
+  Model             = paste0("SVM (", best_kernel_name, ")"),
+  Main_Setting      = paste0("kernel=", best_kernel_name,
+                             " | C=", best_kernel_row$Best_C),
+  Threshold         = round(best_thr_svm, 2),
+  Test_AUC          = round(auc_svm,  3),
+  Balanced_Accuracy = round(bal_svm,  3),
+  Sensitivity       = round(sens_svm, 3),
+  Specificity       = round(spec_svm, 3)
+)
+print(svm_summary)
+
+# Complete SVM comparison table
+svm_full_comparison <- data.frame(
+  Kernel   = c("Linear", "Radial", "Polynomial"),
+  CV_AUC   = c(round(max(svm_linear$results$ROC), 3),
+               round(max(svm_radial$results$ROC), 3),
+               round(max(svm_poly$results$ROC),   3)),
+  Test_AUC = c(round(as.numeric(auc(roc_linear)), 3),
+               round(as.numeric(auc(roc_radial)), 3),
+               round(auc_svm, 3)),
+  Best_C   = c(svm_linear$bestTune$C,
+               svm_radial$bestTune$C,
+               svm_poly$bestTune$C),
+  Best_Param = c(paste0("C=", svm_linear$bestTune$C),
+                 paste0("C=", svm_radial$bestTune$C,
+                        " | sigma=", svm_radial$bestTune$sigma),
+                 paste0("C=", svm_poly$bestTune$C,
+                        " | degree=", svm_poly$bestTune$degree))
+)
+
+print(svm_full_comparison)
+
+# ROC curves — all three kernels together
+roc_linear_obj <- roc_linear
+roc_radial_obj <- roc_radial
+roc_poly_obj   <- roc_svm
+
+ggroc(list(Linear = roc_linear_obj,
+           Radial = roc_radial_obj,
+           Polynomial = roc_poly_obj),
+      linewidth = 1) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+  scale_color_manual(
+    values = c("Linear" = "steelblue", "Radial" = "#41ab5d", "Polynomial" = "purple"),
+    labels = c(
+      paste0("Linear (AUC=",     round(as.numeric(auc(roc_linear_obj)), 3), ")"),
+      paste0("Radial (AUC=",     round(as.numeric(auc(roc_radial_obj)), 3), ")"),
+      paste0("Polynomial (AUC=", round(as.numeric(auc(roc_poly_obj)),   3), ")")
+    )
+  ) +
+  labs(
+    title    = "SVM: ROC Curves by Kernel",
+    subtitle = "Test set evaluation",
+    x = "Specificity", y = "Sensitivity",
+    color = "Kernel"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+# Save everything
+saveRDS(svm_full_comparison, "svm_full_comparison.rds")
+saveRDS(roc_linear_obj,      "svm_roc_linear.rds")
+saveRDS(roc_radial_obj,      "svm_roc_radial.rds")
+saveRDS(roc_poly_obj,        "svm_roc_poly.rds")
+
+cat("CV vs Test AUC gap:\n")
+cat("Linear:     CV=", round(max(svm_linear$results$ROC), 3),
+    "| Test=", round(as.numeric(auc(roc_linear)), 3), "\n")
+cat("Radial:     CV=", round(max(svm_radial$results$ROC), 3),
+    "| Test=", round(as.numeric(auc(roc_radial)), 3), "\n")
+cat("Polynomial: CV=", round(max(svm_poly$results$ROC),   3),
+    "| Test=", round(auc_svm, 3), "\n")
+
+
+
+
 
 #====================================================================
 # FINAL ROC PLOT (All Machine Learning Models)
