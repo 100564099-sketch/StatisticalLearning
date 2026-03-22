@@ -42,6 +42,8 @@ library(kernlab)
 library(randomForest)
 library(tree)
 library(class)
+library(keras)
+library(tensorflow)
 
 # Load dataset
 mental <- read.csv("mental_health.csv")
@@ -1424,7 +1426,264 @@ The combined ROC plot confirms that Linear kernel generalises best on the test s
 
 
 
+## **Neural Network**
 
+Neural networks learn hierarchical representations of the data by composing multiple layers of non-linear transformations. Unlike the tree-based and kernel-based models evaluated previously, a neural network can in principle capture complex interactions between features without explicit specification. However, this flexibility comes at the cost of higher variance and a greater risk of overfitting — particularly on tabular datasets with moderate signal. Regularisation through dropout and batch normalisation, combined with early stopping, is therefore critical.
+
+### Data Preparation
+
+Neural networks are sensitive to feature scale and require standardised inputs. `prepare_data` was called with `scale = TRUE`, applying SMOTE to balance the training set and standardising all numeric predictors. Categorical variables were converted to dummy variables via `model.matrix`, producing a 76-feature numeric matrix.
+```{r nn-prep, echo=FALSE}
+library(keras3)
+
+all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
+nn_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = TRUE)
+
+train_sc_nn <- nn_data$train
+val_sc_nn   <- nn_data$val
+test_sc_nn  <- nn_data$test
+
+y_val_nn  <- val_sc_nn$Has_Mental_Health_Issue
+y_test_nn <- test_sc_nn$Has_Mental_Health_Issue
+
+prep_nn_matrix <- function(df) {
+  df_dummy <- model.matrix(Has_Mental_Health_Issue ~ ., data = df)[, -1]
+  label    <- as.numeric(df$Has_Mental_Health_Issue == "Yes")
+  list(x = df_dummy, y = label)
+}
+
+train_nn <- prep_nn_matrix(train_sc_nn)
+val_nn   <- prep_nn_matrix(val_sc_nn)
+test_nn  <- prep_nn_matrix(test_sc_nn)
+
+n_features <- ncol(train_nn$x)
+cat("Features:", n_features, "\n")
+cat("Training rows:", nrow(train_nn$x), "\n")
+```
+
+### Architecture
+
+A funnel architecture was used: each additional hidden layer has half the units of the previous one, progressively compressing the representation. Every hidden layer is followed by batch normalisation (to stabilise training) and dropout (to regularise). The output layer uses a sigmoid activation for binary classification.
+```{r nn-build, echo=FALSE}
+build_nn <- function(n_layers, units, dropout, lr, n_features) {
+  model <- keras_model_sequential()
+  model <- model %>%
+    layer_dense(units = units, activation = "relu", input_shape = n_features) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = dropout)
+  if (n_layers > 1) {
+    for (l in 2:n_layers) {
+      units_l <- max(8, units / (2^(l-1)))
+      model <- model %>%
+        layer_dense(units = units_l, activation = "relu") %>%
+        layer_batch_normalization() %>%
+        layer_dropout(rate = dropout)
+    }
+  }
+  model <- model %>% layer_dense(units = 1, activation = "sigmoid")
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = lr),
+    loss      = "binary_crossentropy",
+    metrics   = list(metric_auc(name = "auc"))
+  )
+  model
+}
+```
+
+### Hyperparameter Tuning
+
+A grid search was performed over four hyperparameters: number of hidden layers ∈ {1, 2, 3}, units in the first layer ∈ {16, 32, 64, 128}, dropout rate ∈ {0.2, 0.4}, and learning rate ∈ {0.0001, 0.001, 0.01} — 54 combinations in total. Each combination was trained with early stopping (patience = 10, monitored on validation AUC) to prevent overfitting and ensure fair comparison. Combinations that stopped before epoch 5 were excluded from selection, as these reflect unstable training rather than genuine optimisation.
+```{r nn-grid, echo=FALSE}
+nn_grid_results <- readRDS("nn_grid_results.rds")
+best_nn_params  <- readRDS("nn_best_params.rds")
+
+print(nn_grid_results %>% arrange(desc(val_AUC)))
+print(best_nn_params)
+
+ggplot(nn_grid_results,
+       aes(x = factor(units), y = val_AUC,
+           color = factor(dropout), group = factor(dropout))) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_grid(n_layers ~ lr, labeller = label_both) +
+  scale_color_manual(values = c("0.2" = "steelblue", "0.4" = "tomato")) +
+  labs(
+    title    = "Neural Network: Grid Search Results",
+    subtitle = "Validation AUC across hyperparameter combinations",
+    x = "Units", y = "Validation AUC", color = "Dropout"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+The grid search reveals several consistent patterns. Dropout = 0.4 outperforms 0.2 across nearly all combinations, confirming that stronger regularisation is beneficial for this dataset. Shallow networks (1 layer) tend to perform as well as or better than deeper ones — the signal in the data is relatively simple and does not require deep hierarchical representations. Learning rate = 0.01 produces unstable training for larger networks (many combinations stop at epoch 1), which motivated the minimum epoch filter. The best combination is a single hidden layer with 128 units, dropout = 0.4, and learning rate = 0.0001.
+
+### Final Model and Training Curves
+```{r nn-final, echo=FALSE}
+set.seed(42)
+keras3::set_random_seed(42)
+
+nn_final <- build_nn(
+  n_layers   = best_nn_params$n_layers,
+  units      = best_nn_params$units,
+  dropout    = best_nn_params$dropout,
+  lr         = best_nn_params$lr,
+  n_features = n_features
+)
+
+summary(nn_final)
+
+history_final <- nn_final %>% fit(
+  x               = train_nn$x,
+  y               = train_nn$y,
+  epochs          = 200,
+  batch_size      = 64,
+  validation_data = list(val_nn$x, val_nn$y),
+  callbacks       = list(
+    callback_early_stopping(
+      monitor              = "val_auc",
+      patience             = 15,
+      mode                 = "max",
+      restore_best_weights = TRUE
+    )
+  ),
+  verbose = 0
+)
+
+history_df <- data.frame(
+  epoch      = seq_along(history_final$metrics$auc),
+  train_auc  = history_final$metrics$auc,
+  val_auc    = history_final$metrics$val_auc,
+  train_loss = history_final$metrics$loss,
+  val_loss   = history_final$metrics$val_loss
+)
+
+# AUC curve
+ggplot(history_df %>% pivot_longer(cols = c(train_auc, val_auc),
+                                   names_to = "set", values_to = "AUC"),
+       aes(x = epoch, y = AUC, color = set)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("train_auc" = "steelblue", "val_auc" = "tomato"),
+                     labels = c("Train", "Validation")) +
+  labs(title    = "Neural Network: Training Curve (AUC)",
+       subtitle = paste("Best val AUC =", round(max(history_df$val_auc), 4)),
+       x = "Epoch", y = "AUC", color = "") +
+  theme_minimal(base_size = 13)
+
+# Loss curve
+ggplot(history_df %>% pivot_longer(cols = c(train_loss, val_loss),
+                                   names_to = "set", values_to = "Loss"),
+       aes(x = epoch, y = Loss, color = set)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("train_loss" = "steelblue", "val_loss" = "tomato"),
+                     labels = c("Train", "Validation")) +
+  labs(title    = "Neural Network: Training Curve (Loss)",
+       subtitle = "Early stopping applied — best weights restored",
+       x = "Epoch", y = "Loss", color = "") +
+  theme_minimal(base_size = 13)
+```
+
+The AUC training curve shows a clean learning pattern: both train and validation AUC rise together in the first 8 epochs, after which validation AUC plateaus at approximately 0.689 while train AUC continues to increase — a classic early overfitting signal. Early stopping correctly identifies this plateau and restores the weights from epoch 12, where validation AUC was highest. The loss curves are smooth and monotonically decreasing with no instability, confirming that the learning rate of 0.0001 is appropriate for this architecture.
+
+### Threshold Selection
+```{r nn-threshold, echo=FALSE}
+p_nn_val <- as.numeric(predict(nn_final, val_nn$x))
+
+best_thr_nn_row <- pick_best_thr_bal(y_val_nn, p_nn_val)$best
+best_thr_nn     <- best_thr_nn_row$threshold
+
+print(best_thr_nn_row)
+
+all_thr_nn <- pick_best_thr_bal(y_val_nn, p_nn_val)$all
+plot_threshold_effect_one(all_thr_nn, "Neural Network", best_thr_nn)
+```
+
+The threshold plot shows smooth, well-behaved curves with a clean crossover between Sensitivity and Specificity near the selected threshold of 0.45. Notably, this is the closest to the default 0.50 among all models evaluated — reflecting that the neural network produces better-calibrated probability estimates than the tree-based or kernel-based models, which all required thresholds above 0.57. This is a consequence of the sigmoid output and binary cross-entropy loss, which directly optimise probability calibration.
+
+### Test Set Evaluation
+```{r nn-test, echo=FALSE}
+p_nn_test <- as.numeric(predict(nn_final, test_nn$x))
+
+pred_nn_test <- factor(
+  ifelse(p_nn_test >= best_thr_nn, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+cm_nn  <- confusionMatrix(pred_nn_test, y_test_nn, positive = "Yes")
+roc_nn <- roc(y_test_nn, p_nn_test, levels = c("No", "Yes"),
+              direction = "<", quiet = TRUE)
+auc_nn <- as.numeric(auc(roc_nn))
+
+sens_nn <- as.numeric(cm_nn$byClass["Sensitivity"])
+spec_nn <- as.numeric(cm_nn$byClass["Specificity"])
+bal_nn  <- 0.5 * (sens_nn + spec_nn)
+acc_nn  <- as.numeric(cm_nn$overall["Accuracy"])
+f1_nn   <- as.numeric(cm_nn$byClass["F1"])
+prec_nn <- as.numeric(cm_nn$byClass["Pos Pred Value"])
+
+nn_test_summary <- data.frame(
+  Model             = paste0("Neural Network (", best_nn_params$n_layers,
+                             "L-", best_nn_params$units, "u)"),
+  Test_AUC          = round(auc_nn,  3),
+  Balanced_Accuracy = round(bal_nn,  3),
+  Threshold         = round(best_thr_nn, 2),
+  Accuracy          = round(acc_nn,  3),
+  Sensitivity       = round(sens_nn, 3),
+  Specificity       = round(spec_nn, 3),
+  Precision         = round(prec_nn, 3),
+  F1                = round(f1_nn,   3)
+)
+print(nn_test_summary)
+
+cm_nn_table <- as.data.frame(cm_nn$table)
+colnames(cm_nn_table) <- c("Prediction", "Reference", "Count")
+print(cm_nn_table)
+
+ggroc(roc_nn, linewidth = 1, color = "#e74c3c") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+  labs(title    = "Neural Network ROC Curve",
+       subtitle = paste("AUC =", round(auc_nn, 3)),
+       x = "Specificity", y = "Sensitivity") +
+  theme_minimal()
+
+cm_nn_df <- as.data.frame(cm_nn$table)
+colnames(cm_nn_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_nn_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#e74c3c") +
+  labs(title = paste0("Neural Network Confusion Matrix (thr = ", best_thr_nn, ")"),
+       x = "Actual", y = "Predicted") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+nn_summary <- data.frame(
+  Model             = "Neural Network",
+  Main_Setting      = paste0(best_nn_params$n_layers, " layers | units=",
+                             best_nn_params$units, " | dropout=",
+                             best_nn_params$dropout, " | lr=", best_nn_params$lr),
+  Threshold         = round(best_thr_nn, 2),
+  Test_AUC          = round(auc_nn,  3),
+  Balanced_Accuracy = round(bal_nn,  3),
+  Sensitivity       = round(sens_nn, 3),
+  Specificity       = round(spec_nn, 3)
+)
+print(nn_summary)
+
+# Save
+nn_final %>% save_model("nn_final.keras")
+saveRDS(history_df,      "nn_history.rds")
+saveRDS(roc_nn,          "nn_roc.rds")
+saveRDS(nn_test_summary, "nn_test_summary.rds")
+saveRDS(nn_summary,      "nn_summary.rds")
+saveRDS(best_thr_nn,     "nn_best_thr.rds")
+saveRDS(p_nn_test,       "nn_probs_test.rds")
+```
+
+The neural network achieves a test AUC of 0.623, placing it between Bagging (0.615) and Random Forest (0.629). The ROC curve shows consistent lift above the diagonal with a notable step around specificity = 0.50, reflecting the model's stronger discrimination in the mid-range of the probability space. The confusion matrix shows 1245 true positives and 83 true negatives, with 598 false negatives — a meaningful improvement over all tree-based models in terms of false negative reduction.
+
+The threshold of 0.45 is the most clinically interpretable of all models — close to 0.50, well-calibrated, and producing a balanced sensitivity (0.676) and specificity (0.532). The Balanced Accuracy of 0.604 is the second highest among all models after Random Forest (0.597), confirming that the neural network generalises well despite the SMOTE-induced training distribution shift. The performance gap between validation AUC (0.689) and test AUC (0.623) is present but smaller than in the SVM models, suggesting that the neural network's smooth probability outputs are more robust to the class distribution mismatch.
 
 
 

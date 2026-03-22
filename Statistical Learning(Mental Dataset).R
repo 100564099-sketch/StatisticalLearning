@@ -810,6 +810,9 @@ library(xgboost)
 library(kknn)
 library(tree)
 library(class)
+library(keras3)
+library(tensorflow)
+
 
 # HELPER FUNCTIONS
 # Calculate metrics for a specific threshold
@@ -2542,24 +2545,410 @@ cat("Polynomial: CV=", round(max(svm_poly$results$ROC),   3),
 
 
 
+#===========================================================
+#=================== NEURAL NETWORK =======================
+#===========================================================
+library(purrr)
+# Neural network backend activations
+install_tensorflow(version = "2.16")
+keras3::keras$backend$backend()
+
+
+# NN requires scaling — use prepare_data with scale = TRUE
+all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
+nn_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = TRUE)
+
+train_sc_nn <- nn_data$train
+val_sc_nn   <- nn_data$val
+test_sc_nn  <- nn_data$test
+
+y_val_nn  <- val_sc_nn$Has_Mental_Health_Issue
+y_test_nn <- test_sc_nn$Has_Mental_Health_Issue
+
+# Prepare matrices
+prep_nn_matrix <- function(df) {
+  df_dummy <- model.matrix(Has_Mental_Health_Issue ~ ., data = df)[, -1]
+  label    <- as.numeric(df$Has_Mental_Health_Issue == "Yes")
+  list(x = df_dummy, y = label)
+}
+
+train_nn <- prep_nn_matrix(train_sc_nn)
+val_nn   <- prep_nn_matrix(val_sc_nn)
+test_nn  <- prep_nn_matrix(test_sc_nn)
+
+n_features <- ncol(train_nn$x)
+cat("Features:", n_features, "\n")
+cat("Training rows:", nrow(train_nn$x), "\n")
+
+# Helper: build model dynamically based on n_layers and units
+build_nn <- function(n_layers, units, dropout, lr, n_features) {
+  
+  model <- keras_model_sequential()
+  
+  # First hidden layer — must specify input_shape
+  model <- model %>%
+    layer_dense(units = units, activation = "relu",
+                input_shape = n_features) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = dropout)
+  
+  # Additional hidden layers — units halved each time
+  if (n_layers > 1) {
+    for (l in 2:n_layers) {
+      units_l <- max(8, units / (2^(l-1)))  # halve each layer, min 8
+      model <- model %>%
+        layer_dense(units = units_l, activation = "relu") %>%
+        layer_batch_normalization() %>%
+        layer_dropout(rate = dropout)
+    }
+  }
+  
+  # Output layer
+  model <- model %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = lr),
+    loss      = "binary_crossentropy",
+    metrics   = list(metric_auc(name = "auc"))
+  )
+  
+  model
+}
+
+# Step 1: Grid search
+n_layers_grid <- c(1, 2, 3)
+units_grid    <- c(32, 64, 128)
+dropout_grid  <- c(0.2, 0.4)
+lr_grid       <- c(0.0001, 0.001, 0.01)
+
+param_grid_nn <- expand.grid(
+  n_layers   = n_layers_grid,
+  units      = units_grid,
+  dropout    = dropout_grid,
+  lr         = lr_grid
+)
+
+cat("Total combinations:", nrow(param_grid_nn), "\n")
+
+nn_grid_results <- map_dfr(seq_len(nrow(param_grid_nn)), function(i) {
+  
+  n_layers_i <- param_grid_nn$n_layers[i]
+  units_i    <- param_grid_nn$units[i]
+  dropout_i  <- param_grid_nn$dropout[i]
+  lr_i       <- param_grid_nn$lr[i]
+  
+  set.seed(42)
+  keras3::set_random_seed(42)
+  
+  model_i <- build_nn(n_layers_i, units_i, dropout_i, lr_i, n_features)
+  
+  history_i <- model_i %>% fit(
+    x               = train_nn$x,
+    y               = train_nn$y,
+    epochs          = 100,
+    batch_size      = 64,
+    validation_data = list(val_nn$x, val_nn$y),
+    callbacks       = list(
+      callback_early_stopping(
+        monitor              = "val_auc",
+        patience             = 10,
+        mode                 = "max",
+        restore_best_weights = TRUE
+      )
+    ),
+    verbose = 0
+  )
+  
+  best_val_auc <- max(history_i$metrics$val_auc)
+  best_epoch   <- which.max(history_i$metrics$val_auc)
+  
+  cat(sprintf("Combo %d/%d: layers=%d units=%d dropout=%.1f lr=%.4f | val_AUC=%.4f (epoch %d)\n",
+              i, nrow(param_grid_nn), n_layers_i, units_i,
+              dropout_i, lr_i, best_val_auc, best_epoch))
+  
+  tibble(
+    n_layers   = n_layers_i,
+    units      = units_i,
+    dropout    = dropout_i,
+    lr         = lr_i,
+    best_epoch = best_epoch,
+    val_AUC    = round(best_val_auc, 4)
+  )
+})
+# buradayızz 22.53'te çalıştırdım
+# Grid search results
+print(nn_grid_results %>% arrange(desc(val_AUC)))
+
+# Filter out combinations that stopped too early (likely unstable)
+nn_grid_results_filtered <- nn_grid_results %>%
+  filter(best_epoch >= 5) %>%
+  arrange(desc(val_AUC))
+
+print(nn_grid_results_filtered)
+
+# Use filtered best params
+best_nn_params <- nn_grid_results_filtered %>% slice(1)
+print(best_nn_params)
+
+# Save grid results immediately
+saveRDS(nn_grid_results, "nn_grid_results.rds")
+saveRDS(best_nn_params,  "nn_best_params.rds")
+cat("Grid results saved!\n")
+
+# Grid search plot
+ggplot(nn_grid_results,
+       aes(x = factor(units), y = val_AUC,
+           color = factor(dropout), group = factor(dropout))) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_grid(n_layers ~ lr, labeller = label_both) +
+  scale_color_manual(values = c("0.2" = "steelblue", "0.4" = "tomato")) +
+  labs(
+    title    = "Neural Network: Grid Search Results",
+    subtitle = "Validation AUC across hyperparameter combinations",
+    x = "Units", y = "Validation AUC",
+    color = "Dropout"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Step 2: Final model with best parameters
+set.seed(42)
+keras3::set_random_seed(42)
+
+nn_final <- build_nn(
+  n_layers   = best_nn_params$n_layers,
+  units      = best_nn_params$units,
+  dropout    = best_nn_params$dropout,
+  lr         = best_nn_params$lr,
+  n_features = n_features
+)
+
+summary(nn_final)
+
+history_final <- nn_final %>% fit(
+  x               = train_nn$x,
+  y               = train_nn$y,
+  epochs          = 200,
+  batch_size      = 64,
+  validation_data = list(val_nn$x, val_nn$y),
+  callbacks       = list(
+    callback_early_stopping(
+      monitor              = "val_auc",
+      patience             = 15,
+      mode                 = "max",
+      restore_best_weights = TRUE
+    )
+  ),
+  verbose = 1
+)
+
+# Step 3: Training curves
+history_df <- data.frame(
+  epoch      = seq_along(history_final$metrics$auc),
+  train_auc  = history_final$metrics$auc,
+  val_auc    = history_final$metrics$val_auc,
+  train_loss = history_final$metrics$loss,
+  val_loss   = history_final$metrics$val_loss
+)
+
+# AUC curve
+ggplot(history_df %>% pivot_longer(cols = c(train_auc, val_auc),
+                                   names_to = "set", values_to = "AUC"),
+       aes(x = epoch, y = AUC, color = set)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("train_auc" = "steelblue", "val_auc" = "tomato"),
+                     labels = c("Train", "Validation")) +
+  labs(title    = "Neural Network: Training Curve (AUC)",
+       subtitle = paste("Best val AUC =", round(max(history_df$val_auc), 4)),
+       x = "Epoch", y = "AUC", color = "") +
+  theme_minimal(base_size = 13)
+
+# Loss curve
+ggplot(history_df %>% pivot_longer(cols = c(train_loss, val_loss),
+                                   names_to = "set", values_to = "Loss"),
+       aes(x = epoch, y = Loss, color = set)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("train_loss" = "steelblue", "val_loss" = "tomato"),
+                     labels = c("Train", "Validation")) +
+  labs(title    = "Neural Network: Training Curve (Loss)",
+       subtitle = "Early stopping applied",
+       x = "Epoch", y = "Loss", color = "") +
+  theme_minimal(base_size = 13)
+
+# Step 4: Threshold selection on validation set
+p_nn_val <- as.numeric(predict(nn_final, val_nn$x))
+
+best_thr_nn_row <- pick_best_thr_bal(y_val_nn, p_nn_val)$best
+best_thr_nn     <- best_thr_nn_row$threshold
+
+print(best_thr_nn_row)
+
+all_thr_nn <- pick_best_thr_bal(y_val_nn, p_nn_val)$all
+plot_threshold_effect_one(all_thr_nn, "Neural Network", best_thr_nn)
+
+# Step 5: Final evaluation on test set
+p_nn_test <- as.numeric(predict(nn_final, test_nn$x))
+
+pred_nn_test <- factor(
+  ifelse(p_nn_test >= best_thr_nn, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+cm_nn  <- confusionMatrix(pred_nn_test, y_test_nn, positive = "Yes")
+roc_nn <- roc(y_test_nn, p_nn_test, levels = c("No", "Yes"),
+              direction = "<", quiet = TRUE)
+auc_nn <- as.numeric(auc(roc_nn))
+
+sens_nn <- as.numeric(cm_nn$byClass["Sensitivity"])
+spec_nn <- as.numeric(cm_nn$byClass["Specificity"])
+bal_nn  <- 0.5 * (sens_nn + spec_nn)
+acc_nn  <- as.numeric(cm_nn$overall["Accuracy"])
+f1_nn   <- as.numeric(cm_nn$byClass["F1"])
+prec_nn <- as.numeric(cm_nn$byClass["Pos Pred Value"])
+
+nn_test_summary <- data.frame(
+  Model             = paste0("Neural Network (", best_nn_params$n_layers,
+                             "L-", best_nn_params$units, "u)"),
+  Test_AUC          = round(auc_nn,  3),
+  Balanced_Accuracy = round(bal_nn,  3),
+  Threshold         = round(best_thr_nn, 2),
+  Accuracy          = round(acc_nn,  3),
+  Sensitivity       = round(sens_nn, 3),
+  Specificity       = round(spec_nn, 3),
+  Precision         = round(prec_nn, 3),
+  F1                = round(f1_nn,   3)
+)
+print(nn_test_summary)
+
+cm_nn_table <- as.data.frame(cm_nn$table)
+colnames(cm_nn_table) <- c("Prediction", "Reference", "Count")
+print(cm_nn_table)
+
+# ROC curve
+ggroc(roc_nn, linewidth = 1, color = "#e74c3c") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+  labs(title    = "Neural Network ROC Curve",
+       subtitle = paste("AUC =", round(auc_nn, 3)),
+       x = "Specificity", y = "Sensitivity") +
+  theme_minimal()
+
+# Confusion matrix
+cm_nn_df <- as.data.frame(cm_nn$table)
+colnames(cm_nn_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_nn_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#e74c3c") +
+  labs(title = paste0("Neural Network Confusion Matrix (thr = ", best_thr_nn, ")"),
+       x = "Actual", y = "Predicted") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# Final summary
+nn_summary <- data.frame(
+  Model             = "Neural Network",
+  Main_Setting      = paste0(best_nn_params$n_layers, " layers | units=",
+                             best_nn_params$units, " | dropout=",
+                             best_nn_params$dropout, " | lr=", best_nn_params$lr),
+  Threshold         = round(best_thr_nn, 2),
+  Test_AUC          = round(auc_nn,  3),
+  Balanced_Accuracy = round(bal_nn,  3),
+  Sensitivity       = round(sens_nn, 3),
+  Specificity       = round(spec_nn, 3)
+)
+print(nn_summary)
+
+# Save everything
+nn_final %>% save_model("nn_final.keras")
+saveRDS(history_df,      "nn_history.rds")
+saveRDS(roc_nn,          "nn_roc.rds")
+saveRDS(nn_test_summary, "nn_test_summary.rds")
+saveRDS(nn_summary,      "nn_summary.rds")
+saveRDS(best_thr_nn,     "nn_best_thr.rds")
+saveRDS(p_nn_test,       "nn_probs_test.rds")
+
+cat("All NN objects saved!\n")
+
+
+
+
+
+
+
+
+
 #====================================================================
 # FINAL ROC PLOT (All Machine Learning Models)
 #====================================================================
-
 roc_list_all <- list(
-  "k-NN" = roc_knn,
-  "Decision Tree" = roc_tree,
-  "Random Forest" = roc_rf,
-  "SVM (Radial)" = roc_svm
+  "k-NN"                = roc_knn,
+  "Decision Tree"       = roc_tree,
+  "Bagging"             = roc_bag,
+  "Random Forest"       = roc_rf,
+  "SVM (Linear)"        = roc_linear_obj,
+  "SVM (Radial)"        = roc_radial_obj,
+  "SVM (Polynomial)"    = roc_poly_obj,
+  "Neural Network"      = roc_nn
 )
 
 auc_vals_all <- sapply(roc_list_all, function(r) as.numeric(auc(r)))
-auc_text_all <- paste0(names(auc_vals_all), ": AUC = ", sprintf("%.3f", auc_vals_all), collapse = "\n")
+auc_text_all <- paste0(names(auc_vals_all), ": AUC = ",
+                       sprintf("%.3f", auc_vals_all), collapse = "\n")
 
 ggroc(roc_list_all, linewidth = 1) +
   theme_minimal(base_size = 14) +
-  labs(title = "Final Project: Machine Learning Models ROC Curves", color = "Model") +
-  scale_color_viridis_d(end = 0.9) +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  scale_color_viridis_d(end = 0.9) +
+  labs(title    = "Machine Learning Models: ROC Curves (Test Set)",
+       subtitle = "All models evaluated on the same held-out test set",
+       color    = "Model") +
   theme(legend.position = "right") +
-  annotate("text", x = 0.45, y = 0.25, label = auc_text_all, hjust = 0, vjust = 0, size = 4)
+  annotate("text", x = 0.45, y = 0.05,
+           label = auc_text_all, hjust = 0, vjust = 0, size = 3.5)
+
+
+
+final_comparison <- bind_rows(
+  knn_summary,
+  tree_summary,
+  bag_summary,
+  rf_summary,
+  data.frame(
+    Model             = "SVM (Linear)",
+    Main_Setting      = paste0("kernel=Linear | C=", svm_linear$bestTune$C),
+    Threshold         = round(pick_best_thr_bal(y_val_svm, p_linear_val)$best$threshold, 2),
+    Test_AUC          = round(as.numeric(auc(roc_linear_obj)), 3),
+    Balanced_Accuracy = round(0.5 * (as.numeric(cm_linear$byClass["Sensitivity"]) +
+                                       as.numeric(cm_linear$byClass["Specificity"])), 3),
+    Sensitivity       = round(as.numeric(cm_linear$byClass["Sensitivity"]), 3),
+    Specificity       = round(as.numeric(cm_linear$byClass["Specificity"]), 3)
+  ),
+  data.frame(
+    Model             = "SVM (Radial)",
+    Main_Setting      = paste0("kernel=Radial | C=", svm_radial$bestTune$C,
+                               " | sigma=", svm_radial$bestTune$sigma),
+    Threshold         = round(pick_best_thr_bal(y_val_svm, p_radial_val)$best$threshold, 2),
+    Test_AUC          = round(as.numeric(auc(roc_radial_obj)), 3),
+    Balanced_Accuracy = round(0.5 * (as.numeric(cm_radial$byClass["Sensitivity"]) +
+                                       as.numeric(cm_radial$byClass["Specificity"])), 3),
+    Sensitivity       = round(as.numeric(cm_radial$byClass["Sensitivity"]), 3),
+    Specificity       = round(as.numeric(cm_radial$byClass["Specificity"]), 3)
+  ),
+  data.frame(
+    Model             = "SVM (Polynomial)",
+    Main_Setting      = paste0("kernel=Polynomial | C=", svm_poly$bestTune$C,
+                               " | degree=", svm_poly$bestTune$degree),
+    Threshold         = round(best_thr_svm, 2),
+    Test_AUC          = round(auc_svm, 3),
+    Balanced_Accuracy = round(bal_svm, 3),
+    Sensitivity       = round(sens_svm, 3),
+    Specificity       = round(spec_svm, 3)
+  ),
+  nn_summary
+)
+
+print(final_comparison %>% arrange(desc(Test_AUC)))
+
