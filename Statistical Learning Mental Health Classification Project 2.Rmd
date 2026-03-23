@@ -2,15 +2,28 @@
 title: '**Statistical Learning: Mental Health Classification Project (Final)**'
 author: "Edgardo Martin Caceres Garcia - Utku Sizanli - Despoina Iapona"
 date: "`r Sys.Date()`"
-output: pdf_document
-toc: true
-number_sections: true
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+geometry: margin=1in
 ---
 
 \newpage
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=8, fig.height=5.5)
+knitr::opts_chunk$set(
+  echo        = FALSE,
+  warning     = FALSE,
+  message     = FALSE,
+  fig.width   = 9,
+  fig.height  = 4.5,
+  fig.align   = "center",
+  out.width   = "100%"
+)
 ```
 
 # **Introduction and Validation Methodology**
@@ -19,16 +32,13 @@ In this project we will be applying advanced machine learning tools (k-Nearest N
 
 ## **Validation Policy (Addressing Methodology Rigor)**
 
-To ensure a robust evaluation and avoid data leakag, we will utilize a strict three-way data split:
+To ensure a robust evaluation and avoid data leakage, we will utilize a strict three-way data split:
 
 - **Training Set (60%)**: Used exclusively for model fitting and applying SMOTE to balance the classes.
+- **Validation Set (20%)**: Used for model selection and hyperparameter tuning, and for optimizing decision thresholds via Cost-Sensitive Learning.
+- **Test Set (20%)**: Used only for the final evaluation of the selected model, providing an unbiased estimate of true model performance on unseen data.
 
-- **Validation Set (20%)**: Used for model selection and hyperparameter tuning, to evaluate the performance of different models and optimizing decision thresholds via Cost-Sensitive Learning.
-
-- **Test Set (20%)**: Used only for the final evaluation of the selected model, providing an unbiased estimate of its true model performance on unseen data.
-
-```{r data-splitting}
-# Load necessary libraries
+```{r data-splitting, echo=TRUE}
 library(caret)
 library(MASS)
 library(dplyr)
@@ -42,350 +52,218 @@ library(kernlab)
 library(randomForest)
 library(tree)
 library(class)
-library(keras)
 library(tensorflow)
+library(purrr)
+library(forcats)
+library(keras3)
 
-# Load dataset
-mental <- read.csv("mental_health.csv")
+mental     <- read.csv("mental_health.csv")
 target_col <- "Has_Mental_Health_Issue"
 
-# Data Preparation
 mental$Has_Mental_Health_Issue <- factor(
   mental$Has_Mental_Health_Issue,
-  levels = c("0", "1"),
-  labels = c("No", "Yes")
+  levels = c("0", "1"), labels = c("No", "Yes")
 )
+mental[] <- lapply(mental, function(x) if (is.character(x)) as.factor(x) else x)
 
-mental[] <- lapply(mental, function(x) if(is.character(x)) as.factor(x) else x)
-
-# Strict 60/20/20 Data Split
 set.seed(42)
-idx_train <- createDataPartition(mental$Has_Mental_Health_Issue, p = 0.60, list = FALSE)
+idx_train    <- createDataPartition(mental$Has_Mental_Health_Issue, p = 0.60, list = FALSE)
 mental_train <- mental[idx_train, ]
 mental_tmp   <- mental[-idx_train, ]
-
-idx_val <- createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)
-mental_val  <- mental_tmp[idx_val, ]
-mental_test <- mental_tmp[-idx_val, ]
+idx_val      <- createDataPartition(mental_tmp$Has_Mental_Health_Issue, p = 0.50, list = FALSE)
+mental_val   <- mental_tmp[idx_val, ]
+mental_test  <- mental_tmp[-idx_val, ]
 ```
 
-With this rigorous data splitting strategy, we ensure that our model evaluation is unbiased and that the performance metrics we report are reflective of how the model will perform on truly unseen data. This approach allows us to confidently select the best performing model based on validation results, while reserving the test set for a final, unbiased assessment of its generalization capabilities.
+With this rigorous data splitting strategy, we ensure that our model evaluation is unbiased and that the performance metrics we report are reflective of how the model will perform on truly unseen data.
 
 # **Helper Functions**
 
 Four helper functions are defined here and reused across all models throughout this analysis.
 
-**`calc_metrics_bal`** computes classification metrics (Accuracy, Precision, Sensitivity, Specificity, Balanced Accuracy, F1) for a given probability threshold. Balanced Accuracy — the average of Sensitivity and Specificity — is used as the primary metric because the dataset has a class imbalance (majority = Yes). Standard accuracy would be misleading here, as a model predicting "Yes" for every observation would still achieve high accuracy.
+**`calc_metrics_bal`** computes classification metrics (Accuracy, Precision, Sensitivity, Specificity, Balanced Accuracy, F1) for a given probability threshold. Balanced Accuracy is used as the primary metric because the dataset has a class imbalance (majority = Yes).
 
-**`pick_best_thr_bal`** sweeps over a grid of thresholds (defined by `thr_grid`) and selects the one that maximises Balanced Accuracy, with ties broken by Sensitivity then Specificity. This function is applied to validation set probabilities for each model, ensuring the threshold is chosen without touching the test set.
+**`pick_best_thr_bal`** sweeps over a grid of thresholds and selects the one that maximises Balanced Accuracy, with ties broken by Sensitivity then Specificity. Applied to validation set probabilities for each model.
 
-**`plot_threshold_effect_one`** visualises how Accuracy, Precision, Sensitivity, and Specificity change as the decision threshold varies. A vertical line marks the selected best threshold. This plot makes the sensitivity-specificity tradeoff explicit and helps justify the chosen threshold.
+**`plot_threshold_effect_one`** visualises how metrics change as the decision threshold varies, with a vertical line marking the selected best threshold.
 
-**`prepare_data`** applies the full data preparation pipeline for a given set of features: (1) subsets to the selected feature columns and the target variable, (2) applies SMOTE to the training set only (`perc.over = 600, perc.under = 100`), ensuring validation and test sets are never touched during balancing, and (3) standardises numeric predictors using mean and standard deviation computed from the SMOTE'd training set, applying the same transformation to validation and test sets. This function is called separately for each model with its own feature set, ensuring that class balancing and scaling are model-specific and do not leak information across models.
+**`prepare_data`** applies the full data preparation pipeline: subsets to feature columns, applies SMOTE to the training set only (`perc.over = 600, perc.under = 100`), and standardises numeric predictors using statistics from the SMOTE'd training set.
 
-```{r helper-functions}
-# Calculate metrics for a specific threshold
+```{r helper-functions, echo=TRUE}
 calc_metrics_bal <- function(y_true, prob_yes, thr) {
-  pred <- factor(ifelse(prob_yes >= thr, "Yes", "No"), levels = c("No","Yes"))
-  cm <- caret::confusionMatrix(pred, y_true, positive = "Yes")
-  
+  pred <- factor(ifelse(prob_yes >= thr, "Yes", "No"), levels = c("No", "Yes"))
+  cm   <- caret::confusionMatrix(pred, y_true, positive = "Yes")
   acc  <- as.numeric(cm$overall["Accuracy"])
   sens <- as.numeric(cm$byClass["Sensitivity"])
   spec <- as.numeric(cm$byClass["Specificity"])
   bal  <- 0.5 * (sens + spec)
-  
   prec <- as.numeric(cm$byClass["Pos Pred Value"])
-  f1   <- if (is.na(prec) || is.na(sens) || (prec + sens) == 0) NA_real_ else 2 * prec * sens / (prec + sens)
-  
+  f1   <- if (is.na(prec) || is.na(sens) || (prec + sens) == 0) NA_real_
+          else 2 * prec * sens / (prec + sens)
   data.frame(threshold = thr, Accuracy = acc, Precision = prec,
              Sensitivity = sens, Specificity = spec, BalancedAcc = bal, F1 = f1)
 }
-# Threshold picker
+
 pick_best_thr_bal <- function(y_true, prob_yes) {
   tbl <- dplyr::bind_rows(lapply(thr_grid, function(t) calc_metrics_bal(y_true, prob_yes, t))) |>
     dplyr::arrange(dplyr::desc(BalancedAcc), dplyr::desc(Sensitivity), dplyr::desc(Specificity))
   list(best = tbl[1, ], all = tbl)
 }
-# Threshold selection plot
+
 plot_threshold_effect_one <- function(tbl_all, model_name, best_thr = NULL) {
-  
   tbl_long <- tbl_all %>%
     dplyr::select(threshold, Accuracy, Precision, Sensitivity, Specificity) %>%
     tidyr::pivot_longer(cols = -threshold, names_to = "Metric", values_to = "Value")
-  
   p <- ggplot(tbl_long, aes(x = threshold, y = Value, color = Metric)) +
-    geom_line(linewidth = 1) +
-    geom_point(size = 1.4) +
-    labs(
-      title = model_name,
-      x = "Probability Threshold",
-      y = "Metric Value"
-    ) +
+    geom_line(linewidth = 1) + geom_point(size = 1.4) +
+    labs(title = model_name, x = "Probability Threshold", y = "Metric Value") +
     coord_cartesian(ylim = c(0, 1)) +
     theme_minimal(base_size = 12) +
-    theme(
-      plot.title = element_text(face = "bold", size = 14),
-      legend.position = "bottom",
-      panel.grid.minor = element_blank()
-    ) +
+    theme(plot.title       = element_text(face = "bold", size = 14),
+          legend.position  = "bottom",
+          panel.grid.minor = element_blank()) +
     scale_color_viridis_d(end = 0.9)
-  
-  # optional: best threshold line (from your val_threshold_summary)
-  if (!is.null(best_thr) && is.finite(best_thr)) {
-    p <- p + geom_vline(xintercept = best_thr, linetype = "solid", color = "black", linewidth = 0.6)
-  }
+  if (!is.null(best_thr) && is.finite(best_thr))
+    p <- p + geom_vline(xintercept = best_thr, linetype = "solid",
+                        color = "black", linewidth = 0.6)
   p
 }
-# apply SMOTE + scaling for a given feature set
+
+scale_apply <- function(df, num_cols, mu, sd) {
+  df[, num_cols] <- sweep(sweep(df[, num_cols], 2, mu, "-"), 2, sd, "/")
+  df
+}
+
 prepare_data <- function(train, val, test, feature_cols, scale = TRUE) {
-  
-  keep <- c("Has_Mental_Health_Issue", feature_cols)
-  
-  tr <- train[, keep]
-  va <- val[,   keep]
-  te <- test[,  keep]
-  
-  # SMOTE on training set
+  keep     <- c("Has_Mental_Health_Issue", feature_cols)
+  tr       <- train[, keep]; va <- val[, keep]; te <- test[, keep]
   tr_smote <- SMOTE(Has_Mental_Health_Issue ~ ., data = tr,
                     perc.over = 600, perc.under = 100)
-  tr_smote$Has_Mental_Health_Issue <- factor(
-    tr_smote$Has_Mental_Health_Issue, levels = c("No", "Yes")
-  )
-  
+  tr_smote$Has_Mental_Health_Issue <- factor(tr_smote$Has_Mental_Health_Issue,
+                                             levels = c("No", "Yes"))
   if (scale) {
-    # Scaling — fit on SMOTE'd train, apply to all
     num_cols <- setdiff(names(tr_smote)[sapply(tr_smote, is.numeric)],
                         "Has_Mental_Health_Issue")
     mu <- colMeans(tr_smote[, num_cols])
-    sd <- apply(tr_smote[, num_cols], 2, sd)
-    sd[sd == 0] <- 1
-    
-    list(
-      train = scale_apply(tr_smote, num_cols, mu, sd),
-      val   = scale_apply(va,       num_cols, mu, sd),
-      test  = scale_apply(te,       num_cols, mu, sd)
-    )
+    sd <- apply(tr_smote[, num_cols], 2, sd); sd[sd == 0] <- 1
+    list(train = scale_apply(tr_smote, num_cols, mu, sd),
+         val   = scale_apply(va, num_cols, mu, sd),
+         test  = scale_apply(te, num_cols, mu, sd))
   } else {
-    # No scaling — return SMOTE'd data as is
     list(train = tr_smote, val = va, test = te)
   }
 }
 
+thr_grid <- seq(0.05, 0.95, by = 0.01)
 ```
 
 # **Machine Learning Models**
 
-For all models, we are evaluating the performance using **Balanced Accuracy** and **ROC-AUC** rather than simple accuracy. In a dataset where 92% of patients have mental health issues, a standard model could achieve 92% accuracy simply by guessing *"Yes"* for every patient, which would be misleading and rendering it clinically useless. Balanced Accuracy accounts for the imbalance by averaging the recall obtained on each class, while ROC-AUC evaluates the model's ability to discriminate between classes across all thresholds.
+For all models, we evaluate performance using **Balanced Accuracy** and **ROC-AUC** rather than simple accuracy. In a dataset where 92% of patients have mental health issues, a model predicting "Yes" for every observation would achieve 92% accuracy while being clinically useless. Balanced Accuracy accounts for class imbalance by averaging recall across classes, while ROC-AUC evaluates discrimination across all thresholds.
 
 ## **k-Nearest Neighbors (k-NN)**
 
-The k-Nearest Neighbors (k-NN) algorithm is a non-parametric method that classifies observations based on the majority vote of its $k$ closest neighbors in the predictor space. Unlike parametric models, k-NN makes no assumptions about the underlying data distribution, allowing it to capture highly irregular decision boundaries. However, because it relies entirely on Euclidean distance between observations, the quality of the predictor set is critical — irrelevant or poorly scaled features directly degrade performance.
+The k-Nearest Neighbors algorithm classifies observations based on the majority vote of its $k$ closest neighbors in the predictor space. Because it relies entirely on Euclidean distance, the quality and scale of the predictor set is critical.
 
 ### Feature Selection
 
-Unlike parametric models where coefficients can absorb the effect of irrelevant predictors, k-NN has no such mechanism. Every feature contributes to the distance calculation equally, so including noisy or irrelevant variables actively harms the model. A dedicated feature selection step is therefore required.
+k-NN has no mechanism to discount irrelevant features -- every feature contributes to the distance calculation equally. Random Forest importance (Mean Decrease Accuracy) was used to rank predictors. Feature selection was performed on the original training data before SMOTE, ensuring importance scores reflect the true signal rather than synthetic observations. Features with importance below the mean of positive importance values were excluded, as were binary and categorical variables (for which Euclidean distance is not meaningful).
 
-Random Forest importance (Mean Decrease Accuracy) was used to rank predictors by their contribution to classification accuracy. This approach is well-suited for k-NN feature selection as it captures non-linear relationships without assuming any distributional structure. Feature selection was performed on the original training data before SMOTE, ensuring that importance scores reflect the true signal in the data rather than synthetic observations.
-
-Features were retained only if their importance exceeded the mean of all positive importance scores — excluding features with zero or negative importance, which indicate predictors that add noise rather than signal. Additionally, binary (0/1) and categorical variables were removed, as Euclidean distance is not meaningful for such variables.
-
-```{r knn-tuning, echo=FALSE}
-# Step 1: Feature selection using RF on original training data (before SMOTE)
+```{r knn-tuning, fig.height=6}
 set.seed(42)
-rf_fs <- randomForest(
-  Has_Mental_Health_Issue ~ .,
-  data       = mental_train,  # original data, not SMOTE'd
-  ntree      = 500,
-  importance = TRUE
-)
-# Get importance scores
-imp <- importance(rf_fs, type = 1)  # Mean Decrease Accuracy
-imp_df <- data.frame(
-  Feature    = rownames(imp),
-  Importance = imp[, 1]
-) %>% arrange(desc(Importance))
-print(imp_df)
-# Plot feature importance
+rf_fs <- randomForest(Has_Mental_Health_Issue ~ ., data = mental_train,
+                      ntree = 500, importance = TRUE)
+imp   <- importance(rf_fs, type = 1)
+imp_df <- data.frame(Feature = rownames(imp), Importance = imp[, 1]) %>%
+  arrange(desc(Importance))
+
 ggplot(imp_df, aes(x = reorder(Feature, Importance), y = Importance)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  coord_flip() +
-  labs(
-    title    = "Random Forest Feature Importance",
-    subtitle = "Feature selection for k-NN (trained on original data)",
-    x = "", y = "Mean Decrease Accuracy"
-  ) +
-  theme_minimal(base_size = 13)
-# Only keep features with positive importance above mean of positive values
-positive_imp <- imp_df$Importance[imp_df$Importance > 0]
+  geom_bar(stat = "identity", fill = "steelblue") + coord_flip() +
+  labs(title    = "Random Forest Feature Importance",
+       subtitle = "Feature selection for k-NN (trained on original data)",
+       x = "", y = "Mean Decrease Accuracy") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.y = element_text(size = 7))
+
+positive_imp          <- imp_df$Importance[imp_df$Importance > 0]
 selected_knn_features <- imp_df$Feature[imp_df$Importance > mean(positive_imp)]
-cat("Selected features for kNN:", length(selected_knn_features), "\n")
-print(selected_knn_features)
-# Remove binary (0/1) and categorical variables
-unique_counts <- sapply(mental_train[, selected_knn_features], function(x) length(unique(x)))
-print(sort(unique_counts))
-binary_or_cat <- sapply(mental_train[, selected_knn_features], function(x) {
-  length(unique(x)) <= 2 | is.factor(x)
-})
-knn_features_final <- selected_knn_features[!binary_or_cat]
-cat("Final kNN features (excluding binary & categorical):\n")
-cat("Count:", length(knn_features_final), "\n")
-print(knn_features_final)
+binary_or_cat         <- sapply(mental_train[, selected_knn_features],
+                                function(x) length(unique(x)) <= 2 | is.factor(x))
+knn_features_final    <- selected_knn_features[!binary_or_cat]
+cat("Final kNN features:", length(knn_features_final), "\n")
 ```
 
-The bar chart above shows the Mean Decrease Accuracy for all predictors. Features to the right of zero improve model accuracy when included; features to the left actively harm it. The final feature set consists of **8 Likert-scale predictors**: `Anxious_Nervous`, `Feel_Understood`, `Social_Support`, `Financial_Stress`, `Work_Life_Balance`, `Work_Stress_Level`, `Compulsive_Behavior`, and `Loneliness` — all measuring psychological or social dimensions on a 1–10 scale.
-
-
+The final feature set consists of **8 Likert-scale predictors**: `Anxious_Nervous`, `Feel_Understood`, `Social_Support`, `Financial_Stress`, `Work_Life_Balance`, `Work_Stress_Level`, `Compulsive_Behavior`, and `Loneliness`.
 
 ### Data Preparation
 
 SMOTE was applied via `prepare_data` to balance the training set, followed by standardisation of all numeric predictors. Scaling parameters were computed from the SMOTE'd training set and applied consistently to validation and test sets to prevent data leakage.
-```{r knn-prep, echo=FALSE}
-knn_data <- prepare_data(mental_train, mental_val, mental_test, knn_features_final, scale = TRUE)
 
+```{r knn-prep}
+knn_data     <- prepare_data(mental_train, mental_val, mental_test,
+                              knn_features_final, scale = TRUE)
 train_sc_knn <- knn_data$train
 val_sc_knn   <- knn_data$val
 test_sc_knn  <- knn_data$test
-
 target_col       <- "Has_Mental_Health_Issue"
 num_feature_cols <- knn_features_final
-
-X_train_num <- as.matrix(train_sc_knn[, num_feature_cols])
-X_val_num   <- as.matrix(val_sc_knn[,   num_feature_cols])
-X_test_num  <- as.matrix(test_sc_knn[,  num_feature_cols])
-
-y_train <- train_sc_knn[[target_col]]
-y_val   <- val_sc_knn[[target_col]]
-y_test  <- test_sc_knn[[target_col]]
-
-data_info <- data.frame(
-  Item  = c("Numeric predictors", "Training rows", "Validation rows", "Test rows"),
-  Value = c(length(num_feature_cols), nrow(X_train_num), nrow(X_val_num), nrow(X_test_num))
-)
-print(data_info)
+X_train_num  <- as.matrix(train_sc_knn[, num_feature_cols])
+X_val_num    <- as.matrix(val_sc_knn[, num_feature_cols])
+X_test_num   <- as.matrix(test_sc_knn[, num_feature_cols])
+y_train      <- train_sc_knn[[target_col]]
+y_val        <- val_sc_knn[[target_col]]
+y_test       <- test_sc_knn[[target_col]]
 ```
 
-### Baseline Model: k = 3
-
-Before tuning, a baseline k-NN model with $k=3$ was fitted on the validation set to establish a reference point. This reveals the model's raw behaviour before any hyperparameter optimisation.
-```{r knn-baseline, echo=FALSE}
-set.seed(42)
-
-knn_k3 <- class::knn(
-  train = X_train_num,
-  test  = X_val_num,
-  cl    = y_train,
-  k     = 3
-)
-
-cm_k3 <- confusionMatrix(knn_k3, y_val, positive = "Yes")
-
-k3_summary <- data.frame(
-  Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced Accuracy"),
-  Value  = c(
-    as.numeric(cm_k3$overall["Accuracy"]),
-    as.numeric(cm_k3$byClass["Sensitivity"]),
-    as.numeric(cm_k3$byClass["Specificity"]),
-    0.5 * (
-      as.numeric(cm_k3$byClass["Sensitivity"]) +
-        as.numeric(cm_k3$byClass["Specificity"])
-    )
-  )
-)
-print(k3_summary)
-
-cm_k3_table <- as.data.frame(cm_k3$table)
-colnames(cm_k3_table) <- c("Prediction", "Reference", "Count")
-print(cm_k3_table)
-```
-
-The baseline model with $k=3$ already reveals a key weakness: Specificity is very low, meaning the model struggles to correctly identify the minority class (No). This motivates careful hyperparameter tuning using a metric that is robust to class imbalance.
+The SMOTE'd training set contains `r nrow(X_train_num)` observations across `r length(num_feature_cols)` features.
 
 ### Hyperparameter Tuning: Selecting k
 
-The number of neighbours $k$ was selected via 5-fold repeated cross-validation (3 repeats) using ROC-AUC as the tuning metric. Only odd values of $k$ were considered (1, 3, 5, ..., 29) to avoid ties in the majority vote. ROC-AUC was preferred over accuracy as it evaluates model discrimination across all thresholds and is robust to class imbalance.
-```{r knn-cv, echo=FALSE}
+The number of neighbours $k$ was selected via 5-fold repeated cross-validation (3 repeats) using ROC-AUC as the tuning metric. Only odd values were considered to avoid ties in the majority vote.
+
+```{r knn-cv, fig.height=4}
 knn_formula <- reformulate(num_feature_cols, response = "Has_Mental_Health_Issue")
-
-ctrl_cv <- trainControl(
-  method          = "repeatedcv",
-  number          = 5,
-  repeats         = 3,
-  classProbs      = TRUE,
-  summaryFunction = twoClassSummary,
-  savePredictions = "final"
-)
-
+ctrl_cv <- trainControl(method = "repeatedcv", number = 5, repeats = 3,
+                        classProbs = TRUE, summaryFunction = twoClassSummary,
+                        savePredictions = "final")
 set.seed(42)
-
-knn_cv <- train(
-  knn_formula,
-  data      = train_sc_knn,
-  method    = "knn",
-  trControl = ctrl_cv,
-  tuneGrid  = data.frame(k = seq(1, 30, by = 2)),
-  metric    = "ROC"
-)
-
-cv_results <- knn_cv$results[, c("k", "ROC", "Sens", "Spec")]
-print(cv_results)
-
-cv_best <- data.frame(
-  Measure = c("Best k", "Best ROC"),
-  Value   = c(knn_cv$bestTune$k, round(max(knn_cv$results$ROC), 4))
-)
-print(cv_best)
+knn_cv <- caret::train(knn_formula, data = train_sc_knn, method = "knn",
+                       trControl = ctrl_cv,
+                       tuneGrid = data.frame(k = seq(1, 30, by = 2)),
+                       metric = "ROC")
 
 ggplot(knn_cv$results, aes(x = k, y = ROC)) +
   geom_line(color = "steelblue", linewidth = 1) +
   geom_point(color = "steelblue", size = 2) +
   geom_vline(xintercept = knn_cv$bestTune$k, linetype = "dashed", color = "red") +
-  annotate(
-    "text",
-    x     = knn_cv$bestTune$k + 0.5,
-    y     = min(knn_cv$results$ROC) + 0.002,
-    label = paste("k =", knn_cv$bestTune$k),
-    color = "red",
-    hjust = 0
-  ) +
-  labs(
-    title    = "k-NN: ROC-AUC vs k",
-    subtitle = "5-fold repeated CV (3 repeats)",
-    x = "k", y = "ROC-AUC"
-  ) +
+  annotate("text", x = knn_cv$bestTune$k + 0.8,
+           y = min(knn_cv$results$ROC) + 0.002,
+           label = paste("k =", knn_cv$bestTune$k), color = "red", hjust = 0) +
+  labs(title    = "k-NN: ROC-AUC vs k",
+       subtitle = "5-fold repeated CV (3 repeats)",
+       x = "k", y = "ROC-AUC") +
   theme_minimal(base_size = 13)
 ```
 
-The plot shows a clear peak at $k=5$, after which ROC-AUC decreases monotonically as $k$ increases. This pattern is expected: small $k$ values are sensitive to local noise, while large $k$ values over-smooth the decision boundary by incorporating too many distant neighbours, losing discriminative power. The selected $k=5$ balances these two extremes.
-
-Note that the CV ROC of 0.926 is evaluated on SMOTE-balanced training folds and therefore does not reflect performance on the true class distribution. The test set evaluation below provides the reliable estimate.
+The plot shows a clear peak at $k = `r knn_cv$bestTune$k`$, after which ROC-AUC decreases monotonically. The CV ROC of `r round(max(knn_cv$results$ROC), 3)` is evaluated on SMOTE-balanced folds and does not reflect performance on the true class distribution -- the test set evaluation below provides the reliable estimate.
 
 ### Threshold Selection
 
-k-NN probability estimates are inherently coarse: with $k$ neighbours, only $k+1$ distinct probability values are possible (0/k, 1/k, ..., k/k). With $k=5$, only 6 unique probability values exist on the validation set, making threshold optimisation unreliable — small changes in threshold produce large discrete jumps in predictions rather than smooth tradeoffs. The default threshold of 0.50 was therefore retained.
-```{r knn-threshold, echo=FALSE}
-# kNN outputs only k+1 unique probability values, making threshold
-# optimisation unreliable — default 0.50 is used instead.
+k-NN probability estimates are inherently coarse: with $k$ neighbours, only $k+1$ distinct probability values are possible. With $k=5$, only 6 unique probabilities exist, making threshold optimisation unreliable. The default threshold of 0.50 was therefore retained.
+
+```{r knn-threshold}
 best_thr_knn <- 0.50
 ```
 
 ### Test Set Evaluation
-```{r knn-test, echo=FALSE}
-p_knn_test <- predict(knn_cv, newdata = test_sc_knn, type = "prob")[, "Yes"]
 
-pred_knn_test <- factor(
-  ifelse(p_knn_test >= best_thr_knn, "Yes", "No"),
-  levels = c("No", "Yes")
-)
-
-cm_test <- confusionMatrix(pred_knn_test, y_test, positive = "Yes")
-
-roc_knn <- roc(
-  y_test, p_knn_test,
-  levels    = c("No", "Yes"),
-  direction = "<",
-  quiet     = TRUE
-)
-
+```{r knn-test, fig.width=10, fig.height=4.5}
+p_knn_test    <- predict(knn_cv, newdata = test_sc_knn, type = "prob")[, "Yes"]
+pred_knn_test <- factor(ifelse(p_knn_test >= best_thr_knn, "Yes", "No"),
+                        levels = c("No", "Yes"))
+cm_test   <- confusionMatrix(pred_knn_test, y_test, positive = "Yes")
+roc_knn   <- roc(y_test, p_knn_test, levels = c("No", "Yes"),
+                 direction = "<", quiet = TRUE)
 auc_knn   <- as.numeric(auc(roc_knn))
 sens_test <- as.numeric(cm_test$byClass["Sensitivity"])
 spec_test <- as.numeric(cm_test$byClass["Specificity"])
@@ -394,248 +272,178 @@ f1_test   <- as.numeric(cm_test$byClass["F1"])
 acc_test  <- as.numeric(cm_test$overall["Accuracy"])
 bal_test  <- 0.5 * (sens_test + spec_test)
 
-knn_test_summary <- data.frame(
-  Model             = paste0("kNN (k=", knn_cv$bestTune$k, ")"),
-  Test_AUC          = round(auc_knn,  3),
-  Balanced_Accuracy = round(bal_test, 3),
-  Threshold         = round(best_thr_knn, 2),
-  Accuracy          = round(acc_test, 3),
-  Sensitivity       = round(sens_test, 3),
-  Specificity       = round(spec_test, 3),
-  Precision         = round(prec_test, 3),
-  F1                = round(f1_test,  3)
-)
-print(knn_test_summary)
-
-cm_test_table <- as.data.frame(cm_test$table)
-colnames(cm_test_table) <- c("Prediction", "Reference", "Count")
-print(cm_test_table)
-
-ggroc(roc_knn, linewidth = 1, color = "steelblue") +
+p1 <- ggroc(roc_knn, linewidth = 1, color = "steelblue") +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
-  labs(
-    title    = "k-NN ROC Curve",
-    subtitle = paste("AUC =", round(auc_knn, 3)),
-    x = "Specificity", y = "Sensitivity"
-  ) +
-  theme_minimal()
+  labs(title = paste("k-NN ROC Curve | AUC =", round(auc_knn, 3)),
+       x = "Specificity", y = "Sensitivity") +
+  theme_minimal(base_size = 12)
 
 cm_df <- as.data.frame(cm_test$table)
 colnames(cm_df) <- c("Prediction", "Reference", "Freq")
-
-ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+p2 <- ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 7) +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
   scale_fill_gradient(low = "white", high = "steelblue") +
-  labs(
-    title = "k-NN Confusion Matrix",
-    x = "Actual", y = "Predicted"
-  ) +
-  theme_minimal()
+  labs(title = paste0("k-NN Confusion Matrix (thr = ", best_thr_knn, ")"),
+       x = "Actual", y = "Predicted") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p1 + p2
 
 knn_summary <- data.frame(
-  Model             = "k-NN",
-  Main_Setting      = paste0("k = ", knn_cv$bestTune$k),
-  Threshold         = round(best_thr_knn, 2),
-  Test_AUC          = round(auc_knn,  3),
-  Balanced_Accuracy = round(bal_test, 3),
-  Sensitivity       = round(sens_test, 3),
-  Specificity       = round(spec_test, 3)
+  Model = "k-NN", Main_Setting = paste0("k = ", knn_cv$bestTune$k),
+  Threshold = round(best_thr_knn, 2), Test_AUC = round(auc_knn, 3),
+  Balanced_Accuracy = round(bal_test, 3), Sensitivity = round(sens_test, 3),
+  Specificity = round(spec_test, 3)
 )
-print(knn_summary)
 ```
 
-The test AUC of 0.545 is only marginally above random guessing (0.5), confirming that k-NN does not generalise well to this dataset. The ROC curve is nearly diagonal, and the confusion matrix shows that the model correctly identifies most Yes cases (Sensitivity = 0.594) but fails substantially on No cases (Specificity = 0.481). The large gap between CV ROC (0.926) and test AUC (0.545) is a direct consequence of SMOTE inflating performance on balanced training folds — the test set reflects the true class distribution where the model's limitations become apparent.
+The test AUC of `r round(auc_knn, 3)` is only marginally above random guessing (0.5), confirming that k-NN does not generalise well to this dataset. The large gap between CV ROC (`r round(max(knn_cv$results$ROC), 3)`) and test AUC (`r round(auc_knn, 3)`) is a direct consequence of SMOTE inflating performance on balanced training folds.
 
 ### Decision Boundary
 
-To visualise the model's decision structure, a 2D decision boundary was constructed using the two most important features — `Anxious_Nervous` and `Feel_Understood`. All remaining features were fixed at their training set mean, and predictions were generated over a dense grid. Jitter was applied to the observed points to account for the discrete nature of Likert-scale values.
-```{r knn-boundary, echo=FALSE}
-top2 <- knn_features_final[1:2]
+To visualise the model's decision structure, a 2D decision boundary was constructed using the two most important features. All remaining features were fixed at their training set mean, and jitter was applied to account for the discrete nature of Likert-scale values.
 
+```{r knn-boundary, fig.width=10, fig.height=4.5}
+top2    <- knn_features_final[1:2]
 x_range <- seq(min(train_sc_knn[[top2[1]]]) - 0.5,
-               max(train_sc_knn[[top2[1]]]) + 0.5,
-               length.out = 150)
+               max(train_sc_knn[[top2[1]]]) + 0.5, length.out = 150)
 y_range <- seq(min(train_sc_knn[[top2[2]]]) - 0.5,
-               max(train_sc_knn[[top2[2]]]) + 0.5,
-               length.out = 150)
-
+               max(train_sc_knn[[top2[2]]]) + 0.5, length.out = 150)
 grid_df <- expand.grid(setNames(list(x_range, y_range), top2))
-
-for (col in setdiff(num_feature_cols, top2)) {
+for (col in setdiff(num_feature_cols, top2))
   grid_df[[col]] <- mean(train_sc_knn[[col]])
-}
+grid_df$Predicted <- predict(knn_cv, newdata = grid_df, type = "raw")
 
-grid_pred <- predict(knn_cv, newdata = grid_df, type = "raw")
-grid_df$Predicted <- grid_pred
-
-p_train <- ggplot() +
+p_tr <- ggplot() +
   geom_tile(data = grid_df,
-    aes(x = .data[[top2[1]]], y = .data[[top2[2]]], fill = Predicted), alpha = 0.2) +
+            aes(x = .data[[top2[1]]], y = .data[[top2[2]]], fill = Predicted),
+            alpha = 0.2) +
   geom_jitter(data = train_sc_knn,
-    aes(x = .data[[top2[1]]], y = .data[[top2[2]]], color = Has_Mental_Health_Issue),
-    size = 1.5, alpha = 0.6, shape = 16, width = 0.05, height = 0.05) +
+              aes(x = .data[[top2[1]]], y = .data[[top2[2]]],
+                  color = Has_Mental_Health_Issue),
+              size = 1.2, alpha = 0.5, width = 0.05, height = 0.05) +
   scale_fill_manual(values  = c("No" = "#4393c3", "Yes" = "#d6604d")) +
   scale_color_manual(values = c("No" = "#1a6099", "Yes" = "#b2182b")) +
-  labs(title = "Training Set", x = top2[1], y = top2[2],
-       fill = "Predicted", color = "Actual") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom")
+  labs(title = "Training Set", x = top2[1], y = top2[2]) +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
 
-p_test <- ggplot() +
+p_te <- ggplot() +
   geom_tile(data = grid_df,
-    aes(x = .data[[top2[1]]], y = .data[[top2[2]]], fill = Predicted), alpha = 0.2) +
+            aes(x = .data[[top2[1]]], y = .data[[top2[2]]], fill = Predicted),
+            alpha = 0.2) +
   geom_jitter(data = test_sc_knn,
-    aes(x = .data[[top2[1]]], y = .data[[top2[2]]], color = Has_Mental_Health_Issue),
-    size = 2, alpha = 0.7, shape = 16, width = 0.05, height = 0.05) +
+              aes(x = .data[[top2[1]]], y = .data[[top2[2]]],
+                  color = Has_Mental_Health_Issue),
+              size = 1.5, alpha = 0.6, width = 0.05, height = 0.05) +
   scale_fill_manual(values  = c("No" = "#4393c3", "Yes" = "#d6604d")) +
   scale_color_manual(values = c("No" = "#1a6099", "Yes" = "#b2182b")) +
-  labs(title = "Test Set", x = top2[1], y = top2[2],
-       fill = "Predicted", color = "Actual") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom")
+  labs(title = "Test Set", x = top2[1], y = top2[2]) +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
 
-p_train + p_test +
+p_tr + p_te +
   plot_annotation(
     title    = "k-NN Decision Boundary",
-    subtitle = paste0("Top 2 features: ", top2[1], " vs ", top2[2],
+    subtitle = paste0("Features: ", top2[1], " vs ", top2[2],
                       " | k = ", knn_cv$bestTune$k,
-                      " | Other features fixed at training mean",
-                      " | Jitter applied for discrete Likert values")
-  )
+                      " | Other features at training mean"))
 ```
 
-The decision boundary plots confirm the model's limitations. The boundary is highly irregular and fragmented — a characteristic of k-NN with small $k$ — and does not align well with the observed class separation. The considerable overlap between Yes and No classes across both features explains the poor discriminative performance. On the test set, the boundary fails to cleanly separate the two classes, particularly in the mid-range of both features where most observations lie.
+The boundary is highly irregular and fragmented -- characteristic of k-NN with small $k$ -- and does not align well with the observed class separation. The considerable overlap between Yes and No classes confirms the poor discriminative performance.
 
 ### Why k-NN is Unsuitable for This Dataset
 
-Despite careful feature selection, class balancing, and hyperparameter tuning, k-NN performs poorly on this dataset. Three structural reasons explain this:
+**1. Ordinal/Likert predictors.** All 8 selected features are Likert scales (1-10). k-NN computes Euclidean distances between them, assuming equal intervals -- an assumption that does not hold for ordinal data.
 
-**1. Ordinal/Likert predictors.** All 8 selected features are Likert scales (1–10). k-NN treats these as continuous and computes Euclidean distances between them, but this assumes that the interval between any two consecutive values is equal and meaningful — an assumption that does not hold for ordinal data. The difference between a score of 1 and 2 on an anxiety scale is not necessarily the same as the difference between 9 and 10. This undermines the distance metric that k-NN fundamentally relies on.
+**2. SMOTE distortion.** SMOTE generates synthetic observations by interpolating between existing ones, producing non-integer values (e.g. `Anxious_Nervous = 3.7`) that distort the distance space.
 
-**2. SMOTE distortion.** SMOTE generates synthetic training observations by interpolating between existing ones. For Likert-scale variables, this produces non-integer values (e.g. `Anxious_Nervous = 3.7`) that do not exist in the original data. The model is therefore trained on a distance space that does not match the test set, contributing to the large gap between CV ROC (0.926) and test AUC (0.545).
+**3. Curse of dimensionality.** With 8 features, observations become increasingly equidistant, making the neighbourhood selection essentially arbitrary.
 
-**3. Curse of dimensionality.** With 8 features, observations become increasingly equidistant from one another in the feature space. As dimensionality grows, the concept of "nearest neighbours" loses meaning — the ratio of the nearest to farthest neighbour distances approaches 1, making the neighbourhood selection essentially arbitrary.
-
-Together, these factors make k-NN a poor fit for this problem. Parametric models that exploit global structure in the data are better suited to datasets with ordinal predictors and class imbalance.
-
-
-
+---
 
 ## **Decision Tree**
 
-A single decision tree provides an interpretable, hierarchical view of the mental health predictors. Unlike ensemble methods, every decision in the tree can be traced back to a specific feature and threshold, making it a useful baseline before moving to more complex models.
+A single decision tree provides an interpretable, hierarchical view of the mental health predictors. Every decision can be traced back to a specific feature and threshold.
 
 ### Data Preparation
 
-All features were passed through `prepare_data` with `scale = FALSE`, applying SMOTE to balance the training set without standardising the predictors. Scaling is intentionally omitted for tree-based models — decision trees split on feature thresholds, so the absolute scale of predictors does not affect the splitting criterion. Keeping the original scale also makes the pruned tree directly interpretable, as split thresholds correspond to real feature values rather than standardised scores. The same unscaled SMOTE'd data is reused across Decision Tree, Bagging, and Random Forest to ensure a fair comparison.
-```{r tree-prep, echo=FALSE}
-all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
-tree_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = FALSE)
+All features were passed through `prepare_data` with `scale = FALSE`. Scaling is intentionally omitted for tree-based models -- decision trees split on feature thresholds, so the absolute scale of predictors does not affect the splitting criterion. The same unscaled SMOTE'd data is reused across Decision Tree, Bagging, and Random Forest.
 
+```{r tree-prep}
+all_features  <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
+tree_data     <- prepare_data(mental_train, mental_val, mental_test,
+                               all_features, scale = FALSE)
 train_sc_tree <- tree_data$train
 val_sc_tree   <- tree_data$val
 test_sc_tree  <- tree_data$test
-
-y_val_tree  <- val_sc_tree$Has_Mental_Health_Issue
-y_test_tree <- test_sc_tree$Has_Mental_Health_Issue
+y_val_tree    <- val_sc_tree$Has_Mental_Health_Issue
+y_test_tree   <- test_sc_tree$Has_Mental_Health_Issue
 ```
 
 ### Hyperparameter Tuning
 
-Two hyperparameters control tree complexity before pruning: `mindev` (the minimum deviance reduction required for a split) and `minsize` (the minimum number of observations in a node before it can be split). Larger `mindev` and `minsize` values produce smaller, more regularised trees.
+Two hyperparameters control tree complexity before pruning: `mindev` (minimum deviance reduction required for a split) and `minsize` (minimum observations in a node). A grid search was performed over `mindev` in {0.001, 0.005, 0.01, 0.02} and `minsize` in {5, 10, 20, 30}, evaluating each combination by validation ROC-AUC after 5-fold CV pruning.
 
-A grid search was performed over combinations of `mindev` ∈ {0.001, 0.005, 0.01, 0.02} and `minsize` ∈ {5, 10, 20, 30}. For each combination, a 5-fold cross-validated pruned tree was grown and evaluated on the validation set using ROC-AUC. This ensures the hyperparameter selection is based on out-of-sample performance, not training error.
-```{r tree-hptuning, echo=FALSE}
+```{r tree-hptuning, fig.height=4}
 mindev_grid  <- c(0.001, 0.005, 0.01, 0.02)
 minsize_grid <- c(5, 10, 20, 30)
-
-hp_grid <- expand.grid(mindev = mindev_grid, minsize = minsize_grid)
+hp_grid      <- expand.grid(mindev = mindev_grid, minsize = minsize_grid)
 
 cv_hp_results <- map_dfr(seq_len(nrow(hp_grid)), function(i) {
-  mindev_i  <- hp_grid$mindev[i]
-  minsize_i <- hp_grid$minsize[i]
-  
   set.seed(42)
-  tree_i <- tree(
-    Has_Mental_Health_Issue ~ .,
-    data    = train_sc_tree,
-    control = tree.control(
-      nobs    = nrow(train_sc_tree),
-      mindev  = mindev_i,
-      minsize = minsize_i
-    )
-  )
-  
+  tree_i  <- tree(Has_Mental_Health_Issue ~ ., data = train_sc_tree,
+                  control = tree.control(nobs = nrow(train_sc_tree),
+                                         mindev = hp_grid$mindev[i],
+                                         minsize = hp_grid$minsize[i]))
   cv_i        <- cv.tree(tree_i, FUN = prune.misclass, K = 5)
   best_size_i <- min(cv_i$size[cv_i$dev == min(cv_i$dev)])
   pruned_i    <- prune.misclass(tree_i, best = best_size_i)
   prob_val_i  <- predict(pruned_i, newdata = val_sc_tree, type = "vector")[, "Yes"]
-  
-  roc_i   <- roc(y_val_tree, prob_val_i, levels = c("No", "Yes"),
-                 direction = "<", quiet = TRUE)
-  auc_i   <- as.numeric(auc(roc_i))
-  thr_row <- pick_best_thr_bal(y_val_tree, prob_val_i)$best
-  
-  tibble(mindev = mindev_i, minsize = minsize_i, best_size = best_size_i,
-         Val_AUC = round(auc_i, 4), Val_BalancedAcc = round(thr_row$BalancedAcc, 4))
+  roc_i       <- roc(y_val_tree, prob_val_i, levels = c("No","Yes"),
+                     direction = "<", quiet = TRUE)
+  thr_row     <- pick_best_thr_bal(y_val_tree, prob_val_i)$best
+  tibble(mindev = hp_grid$mindev[i], minsize = hp_grid$minsize[i],
+         best_size = best_size_i, Val_AUC = round(as.numeric(auc(roc_i)), 4),
+         Val_BalancedAcc = round(thr_row$BalancedAcc, 4))
 })
 
-print(cv_hp_results)
-
-best_hp     <- cv_hp_results %>% arrange(desc(Val_AUC)) %>% slice(1)
+best_hp      <- cv_hp_results %>% arrange(desc(Val_AUC)) %>% slice(1)
 best_mindev  <- best_hp$mindev
 best_minsize <- best_hp$minsize
-print(best_hp)
 
 ggplot(cv_hp_results %>% distinct(mindev, .keep_all = TRUE),
        aes(x = factor(mindev), y = Val_AUC, group = 1)) +
   geom_line(color = "steelblue", linewidth = 1) +
   geom_point(color = "steelblue", size = 2.5) +
-  labs(
-    title    = "Decision Tree: Hyperparameter Grid Search",
-    subtitle = "minsize has no effect — mindev is the dominant regularisation parameter",
-    x = "mindev", y = "Validation AUC"
-  ) +
+  geom_vline(xintercept = which(levels(factor(cv_hp_results$mindev)) ==
+                                  as.character(best_mindev)),
+             linetype = "dashed", color = "red") +
+  labs(title    = "Decision Tree: Hyperparameter Grid Search",
+       subtitle = "minsize has no effect -- mindev is the dominant regularisation parameter",
+       x = "mindev", y = "Validation AUC") +
   theme_minimal(base_size = 13)
 ```
 
-The grid search reveals that `minsize` has no meaningful effect on validation AUC — all four `minsize` values produce identical results for each `mindev`. This is expected: with a training set of over 6,000 observations after SMOTE, the minimum node size constraint rarely becomes binding. The dominant regularisation parameter is `mindev`, which directly controls the minimum impurity gain required to continue splitting. The plot shows a U-shaped pattern — very small `mindev` (0.001) allows the tree to grow large and capture more signal, while intermediate values (0.005, 0.01) over-regularise and reduce AUC. The best combination was `mindev = 0.001`, `minsize = 5`, yielding a validation AUC of 0.604.
+The grid search reveals that `minsize` has no meaningful effect -- with over 6,000 training observations after SMOTE, the constraint rarely binds. The best combination is `mindev = `r best_mindev``, `minsize = `r best_minsize``, yielding validation AUC of `r best_hp$Val_AUC`.
 
 ### Pruning via Cross-Validation
 
-With the best hyperparameters identified, a full tree was grown and then pruned using 5-fold cross-validation on misclassification error. Cost-complexity pruning evaluates a sequence of subtrees and selects the size that minimises CV error, preventing overfitting while retaining predictive structure.
-```{r tree-pruning, echo=FALSE}
+```{r tree-pruning, fig.height=4}
 set.seed(42)
-mental_tree_full <- tree(
-  Has_Mental_Health_Issue ~ .,
-  data    = train_sc_tree,
-  control = tree.control(
-    nobs    = nrow(train_sc_tree),
-    mindev  = best_mindev,
-    minsize = best_minsize
-  )
-)
-
-cat("Full tree terminal nodes:", sum(mental_tree_full$frame$var == "<leaf>"), "\n")
-
+mental_tree_full <- tree(Has_Mental_Health_Issue ~ ., data = train_sc_tree,
+                          control = tree.control(nobs = nrow(train_sc_tree),
+                                                  mindev = best_mindev,
+                                                  minsize = best_minsize))
 set.seed(42)
-mental_cv <- cv.tree(mental_tree_full, FUN = prune.misclass, K = 5)
-
-cv_results_tree <- data.frame(size = mental_cv$size, cv_error = mental_cv$dev)
-print(cv_results_tree)
-
-best_size <- min(mental_cv$size[mental_cv$dev == min(mental_cv$dev)])
-
-data.frame(Measure = c("Minimum CV error", "Best tree size"),
-           Value   = c(min(mental_cv$dev), best_size)) %>% print()
+mental_cv  <- cv.tree(mental_tree_full, FUN = prune.misclass, K = 5)
+best_size  <- min(mental_cv$size[mental_cv$dev == min(mental_cv$dev)])
 
 tibble(size = mental_cv$size, cv_error = mental_cv$dev) %>%
   ggplot(aes(x = size, y = cv_error)) +
   geom_line(color = "steelblue", linewidth = 1) +
   geom_point(color = "steelblue", size = 2.5) +
   geom_vline(xintercept = best_size, linetype = "dashed", color = "red") +
-  annotate("text", x = best_size + 0.3, y = max(mental_cv$dev) * 0.98,
+  annotate("text", x = best_size + 2, y = max(mental_cv$dev) * 0.98,
            label = paste("best =", best_size), color = "red", hjust = 0) +
   labs(title    = "Decision Tree: CV Error vs Tree Size",
        subtitle = paste("Best size =", best_size),
@@ -643,45 +451,44 @@ tibble(size = mental_cv$size, cv_error = mental_cv$dev) %>%
   theme_minimal(base_size = 13)
 
 mental_tree_pruned <- prune.misclass(mental_tree_full, best = best_size)
-
-plot(mental_tree_pruned)
-text(mental_tree_pruned, pretty = 0, cex = 0.8)
-title(paste("Mental Health: Pruned Tree (", best_size, "leaves)"))
 ```
 
-The CV error drops sharply as the tree grows from 1 to approximately 40 terminal nodes, after which it plateaus — additional splits no longer reduce misclassification. The full tree with 251 terminal nodes is therefore substantially pruned to 40 leaves, retaining the structure that genuinely generalises while discarding splits that overfit to the training data.
+The full tree with `r sum(mental_tree_full$frame$var == "<leaf>")` terminal nodes is pruned to `r best_size` leaves. CV error drops sharply up to ~40 nodes then plateaus -- additional splits no longer reduce misclassification.
 
-The pruned tree is substantially richer than previous iterations and uses a wide range of clinically meaningful features. `Social_Support` appears as the root split, indicating it is the single most informative predictor of mental health issues. Subsequent splits introduce `Family_History_Mental_Illness`, `Suicidal_Thoughts`, `Feeling_Worthless`, `Work_Stress_Level`, `Anxious_Nervous`, `Loneliness`, and others — capturing both environmental and psychological dimensions of mental health. Importantly, the split thresholds are expressed in the original feature scale, making the tree directly interpretable without any back-transformation.
+```{r tree-viz, fig.width=11, fig.height=7}
+op <- par(mar = c(1, 1, 2, 1), xpd = NA)
+plot(mental_tree_pruned)
+text(mental_tree_pruned, pretty = 0, cex = 0.45)
+title(paste("Mental Health: Pruned Tree (", best_size, "leaves)"), cex.main = 1.1)
+par(op)
+```
+
+`Social_Support` appears as the root split -- the single most informative predictor. Subsequent splits introduce `Family_History_Mental_Illness`, `Suicidal_Thoughts`, `Feeling_Worthless`, `Work_Stress_Level`, and others, capturing both environmental and psychological dimensions.
 
 ### Threshold Selection
-```{r tree-threshold, echo=FALSE}
-p_tree_val <- predict(mental_tree_pruned, newdata = val_sc_tree,
-                      type = "vector")[, "Yes"]
 
+```{r tree-threshold, fig.height=4}
+p_tree_val        <- predict(mental_tree_pruned, newdata = val_sc_tree,
+                              type = "vector")[, "Yes"]
 best_thr_tree_row <- pick_best_thr_bal(y_val_tree, p_tree_val)$best
 best_thr_tree     <- best_thr_tree_row$threshold
-
-print(best_thr_tree_row)
-
-all_thr_tree <- pick_best_thr_bal(y_val_tree, p_tree_val)$all
+all_thr_tree      <- pick_best_thr_bal(y_val_tree, p_tree_val)$all
 plot_threshold_effect_one(all_thr_tree, "Decision Tree", best_thr_tree)
 ```
 
-The optimal threshold of 0.81 was selected by maximising Balanced Accuracy on the validation set. This unusually high threshold reflects a characteristic of decision tree probability estimates — each leaf returns the proportion of training observations of each class, and with SMOTE applied, many leaves produce high "Yes" probabilities. Setting a high threshold compensates for this upward bias, effectively requiring stronger evidence before predicting "Yes". The threshold plot shows clear discrete jumps rather than smooth curves, consistent with the finite number of unique probability values produced by a 40-leaf tree.
+The optimal threshold of `r best_thr_tree` was selected by maximising Balanced Accuracy on the validation set. This high value reflects that SMOTE inflates "Yes" probabilities in leaf nodes -- a high threshold compensates by requiring stronger evidence before predicting "Yes". The discrete jumps in the plot are consistent with the finite number of unique probability values from a `r best_size`-leaf tree.
 
 ### Test Set Evaluation
-```{r tree-test, echo=FALSE}
-p_tree_test <- predict(mental_tree_pruned, newdata = test_sc_tree,
-                       type = "vector")[, "Yes"]
 
+```{r tree-test, fig.width=10, fig.height=4.5}
+p_tree_test    <- predict(mental_tree_pruned, newdata = test_sc_tree,
+                           type = "vector")[, "Yes"]
 pred_tree_test <- factor(ifelse(p_tree_test >= best_thr_tree, "Yes", "No"),
                          levels = c("No", "Yes"))
-
 cm_tree  <- confusionMatrix(pred_tree_test, y_test_tree, positive = "Yes")
 roc_tree <- roc(y_test_tree, p_tree_test, levels = c("No", "Yes"),
                 direction = "<", quiet = TRUE)
 auc_tree <- as.numeric(auc(roc_tree))
-
 sens_tree <- as.numeric(cm_tree$byClass["Sensitivity"])
 spec_tree <- as.numeric(cm_tree$byClass["Specificity"])
 bal_tree  <- 0.5 * (sens_tree + spec_tree)
@@ -689,145 +496,98 @@ acc_tree  <- as.numeric(cm_tree$overall["Accuracy"])
 f1_tree   <- as.numeric(cm_tree$byClass["F1"])
 prec_tree <- as.numeric(cm_tree$byClass["Pos Pred Value"])
 
-tree_test_summary <- data.frame(
-  Model             = paste0("Decision Tree (", best_size, " leaves)"),
-  Test_AUC          = round(auc_tree,  3),
-  Balanced_Accuracy = round(bal_tree,  3),
-  Threshold         = round(best_thr_tree, 2),
-  Accuracy          = round(acc_test,  3),
-  Sensitivity       = round(sens_tree, 3),
-  Specificity       = round(spec_tree, 3),
-  Precision         = round(prec_tree, 3),
-  F1                = round(f1_tree,   3)
-)
-print(tree_test_summary)
-
-cm_tree_table <- as.data.frame(cm_tree$table)
-colnames(cm_tree_table) <- c("Prediction", "Reference", "Count")
-print(cm_tree_table)
-
-ggroc(roc_tree, linewidth = 1, color = "steelblue") +
+p1 <- ggroc(roc_tree, linewidth = 1, color = "steelblue") +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
-  labs(title    = "Decision Tree ROC Curve",
-       subtitle = paste("AUC =", round(auc_tree, 3)),
+  labs(title = paste("Decision Tree ROC | AUC =", round(auc_tree, 3)),
        x = "Specificity", y = "Sensitivity") +
-  theme_minimal()
+  theme_minimal(base_size = 12)
 
 cm_tree_df <- as.data.frame(cm_tree$table)
 colnames(cm_tree_df) <- c("Prediction", "Reference", "Freq")
-
-ggplot(cm_tree_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+p2 <- ggplot(cm_tree_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
   scale_fill_gradient(low = "white", high = "steelblue") +
-  labs(title = paste0("Decision Tree Confusion Matrix (thr = ", best_thr_tree, ")"),
+  labs(title = paste0("Confusion Matrix (thr = ", best_thr_tree, ")"),
        x = "Actual", y = "Predicted") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none")
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p1 + p2
 
 tree_summary <- data.frame(
-  Model             = "Decision Tree",
-  Main_Setting      = paste0(best_size, " leaves | mindev=", best_mindev,
-                             " | minsize=", best_minsize),
-  Threshold         = round(best_thr_tree, 2),
-  Test_AUC          = round(auc_tree,  3),
-  Balanced_Accuracy = round(bal_tree,  3),
-  Sensitivity       = round(sens_tree, 3),
-  Specificity       = round(spec_tree, 3)
+  Model = "Decision Tree",
+  Main_Setting = paste0(best_size, " leaves | mindev=", best_mindev,
+                         " | minsize=", best_minsize),
+  Threshold = round(best_thr_tree, 2), Test_AUC = round(auc_tree, 3),
+  Balanced_Accuracy = round(bal_tree, 3), Sensitivity = round(sens_tree, 3),
+  Specificity = round(spec_tree, 3)
 )
-print(tree_summary)
 ```
 
-The decision tree achieves a test AUC of 0.586, modestly above k-NN (0.545) and above random guessing. The ROC curve shows lift above the diagonal across most of the specificity range, confirming the model is capturing real signal. The confusion matrix shows 983 true positives and 98 true negatives, with 860 false negatives as the primary source of error — the model misses a substantial portion of Yes cases, a consequence of the high threshold and the inherent difficulty of this classification problem.
+The decision tree achieves a test AUC of `r round(auc_tree, 3)`, modestly above k-NN. The ROC curve shows lift above the diagonal, confirming the model captures real signal. The `r best_size`-leaf tree provides clinically credible and communicable rules -- however, a single tree suffers from high variance, motivating the transition to Bagging and Random Forest.
 
-The 40-leaf tree strikes a balance between interpretability and complexity. With features such as `Social_Support`, `Family_History_Mental_Illness`, `Suicidal_Thoughts`, and `Work_Stress_Level` driving the decisions, the tree provides clinically credible and communicable rules. However, a single tree still suffers from high variance — small changes in the training data can produce very different trees. This instability motivates the transition to Bagging and Random Forest, which address this weakness by averaging over many trees.
-
-
-
-
-
-
+---
 
 ## **Bagging**
 
-Bagging (Bootstrap Aggregating) extends the single decision tree by training many trees on bootstrap samples of the training data and averaging their predictions. This directly addresses the high variance of a single tree — by averaging over many trees, random fluctuations in individual trees cancel out, producing a more stable and reliable classifier. Unlike Random Forest, Bagging uses all predictors at every split (`mtry = p`), so the trees are highly correlated with each other. This limits the variance reduction compared to Random Forest, but provides a useful intermediate step between a single tree and a fully decorrelated ensemble.
+Bagging (Bootstrap Aggregating) extends the single decision tree by training many trees on bootstrap samples and averaging their predictions, directly addressing the high variance of a single tree. Unlike Random Forest, Bagging uses all predictors at every split (`mtry = p`), so the trees are highly correlated.
+
+```{r bag-data}
+train_bag_data <- train_sc_tree; val_bag_data <- val_sc_tree
+test_bag_data  <- test_sc_tree
+y_val_bag      <- val_sc_tree$Has_Mental_Health_Issue
+y_test_bag     <- test_sc_tree$Has_Mental_Health_Issue
+p              <- ncol(train_bag_data) - 1
+train_rf_data  <- train_sc_tree; val_rf_data  <- val_sc_tree
+test_rf_data   <- test_sc_tree
+y_val_rf       <- val_sc_tree$Has_Mental_Health_Issue
+y_test_rf      <- test_sc_tree$Has_Mental_Health_Issue
+```
 
 ### Number of Trees
 
-The number of trees (`ntree`) is not a hyperparameter to optimise in the traditional sense — more trees never hurt performance, they simply stabilise it. The OOB error was tracked across 500 trees to identify the point at which adding more trees no longer meaningfully reduces error.
-```{r bag-ntree, echo=FALSE}
-set.seed(42)
-mental_bag_ntree <- randomForest(
-  Has_Mental_Health_Issue ~ .,
-  data       = train_bag_data,
-  mtry       = p,
-  ntree      = 500,
-  importance = TRUE
-)
+`ntree` was selected based on OOB error stabilisation -- more trees never hurt, they simply stabilise performance.
 
-oob_df_bag <- tibble(
-  Trees     = seq_len(nrow(mental_bag_ntree$err.rate)),
-  OOB_Error = mental_bag_ntree$err.rate[, "OOB"]
-)
+```{r bag-ntree, fig.height=4}
+set.seed(42)
+mental_bag_ntree <- randomForest(Has_Mental_Health_Issue ~ ., data = train_bag_data,
+                                  mtry = p, ntree = 500, importance = TRUE)
+oob_df_bag <- tibble(Trees = seq_len(nrow(mental_bag_ntree$err.rate)),
+                     OOB_Error = mental_bag_ntree$err.rate[, "OOB"])
+oob_min      <- min(oob_df_bag$OOB_Error)
+ntree_stable <- which(oob_df_bag$OOB_Error <= oob_min * 1.01)[1]
 
 ggplot(oob_df_bag, aes(x = Trees, y = OOB_Error)) +
   geom_line(color = "steelblue", linewidth = 1) +
-  labs(
-    title    = "Bagging: OOB Error vs Number of Trees",
-    subtitle = "Used to determine stable ntree",
-    x = "Number of Trees", y = "OOB Error"
-  ) +
+  geom_vline(xintercept = ntree_stable, linetype = "dashed", color = "red") +
+  annotate("text", x = ntree_stable + 10, y = max(oob_df_bag$OOB_Error) * 0.95,
+           label = paste("stable =", ntree_stable), color = "red", hjust = 0) +
+  labs(title = "Bagging: OOB Error vs Number of Trees",
+       x = "Number of Trees", y = "OOB Error") +
   theme_minimal(base_size = 13)
-
-oob_min      <- min(oob_df_bag$OOB_Error)
-ntree_stable <- which(oob_df_bag$OOB_Error <= oob_min * 1.01)[1]
-cat("Stable ntree:", ntree_stable, "\n")
 ```
 
-The OOB error drops sharply in the first 100 trees and continues to decline gradually, stabilising around tree 353 — the point at which OOB error first falls within 1% of its minimum. All subsequent tuning uses this value.
+OOB error stabilises at tree `r ntree_stable`. All subsequent tuning uses this value.
 
-### Regularisation: nodesize
+### Regularisation: nodesize and maxnodes
 
-`nodesize` controls the minimum number of observations in a terminal node. Larger values produce shallower, more regularised trees. A grid search over `nodesize` ∈ {1, 5, 10, 20, 30} was conducted using OOB error as the evaluation metric.
-```{r bag-nodesize, echo=FALSE}
+```{r bag-nodesize-maxnodes, fig.width=10, fig.height=4}
 nodesize_grid <- c(1, 5, 10, 20, 30)
-
 nodesize_results <- map_dfr(nodesize_grid, function(ns) {
   set.seed(42)
-  fit <- randomForest(
-    Has_Mental_Health_Issue ~ .,
-    data     = train_bag_data,
-    mtry     = p,
-    ntree    = ntree_stable,
-    nodesize = ns
-  )
+  fit <- randomForest(Has_Mental_Health_Issue ~ ., data = train_bag_data,
+                      mtry = p, ntree = ntree_stable, nodesize = ns)
   tibble(nodesize = ns, OOB_Error = fit$err.rate[ntree_stable, "OOB"])
 })
-
-print(nodesize_results)
 best_nodesize_bag <- nodesize_results$nodesize[which.min(nodesize_results$OOB_Error)]
-cat("Best nodesize:", best_nodesize_bag, "\n")
 
-ggplot(nodesize_results, aes(x = nodesize, y = OOB_Error)) +
-  geom_line(color = "steelblue", linewidth = 1) +
-  geom_point(color = "steelblue", size = 2.5) +
+p1 <- ggplot(nodesize_results, aes(x = nodesize, y = OOB_Error)) +
+  geom_line(color = "steelblue", linewidth = 1) + geom_point(color = "steelblue", size = 2.5) +
   geom_vline(xintercept = best_nodesize_bag, linetype = "dashed", color = "red") +
-  annotate("text", x = best_nodesize_bag + 0.5, y = max(nodesize_results$OOB_Error),
-           label = paste("best =", best_nodesize_bag), color = "red", hjust = 0) +
-  labs(title    = "Bagging: OOB Error vs nodesize",
-       subtitle = "Regularisation via minimum terminal node size",
-       x = "nodesize", y = "OOB Error") +
-  theme_minimal(base_size = 13)
-```
+  labs(title = "OOB Error vs nodesize", x = "nodesize", y = "OOB Error") +
+  theme_minimal(base_size = 11)
 
-OOB error increases monotonically with `nodesize` — smaller terminal nodes consistently produce better performance. The best value is `nodesize = 1`, meaning trees are grown to full depth. This is expected for bagging: the variance reduction from averaging many trees compensates for the high variance of individual deep trees, so regularising individual trees via `nodesize` is counterproductive.
-
-### Regularisation: maxnodes
-
-`maxnodes` caps the total number of terminal nodes per tree. A grid search over `maxnodes` ∈ {10, 20, 50, 100, 200, unrestricted} was conducted.
-```{r bag-maxnodes, echo=FALSE}
 maxnodes_grid <- list(10, 20, 50, 100, 200, NULL)
-
 maxnodes_results <- map_dfr(seq_along(maxnodes_grid), function(i) {
   mn <- maxnodes_grid[[i]]
   set.seed(42)
@@ -842,25 +602,22 @@ maxnodes_results <- map_dfr(seq_along(maxnodes_grid), function(i) {
   tibble(maxnodes = ifelse(is.null(mn), Inf, mn),
          OOB_Error = fit$err.rate[ntree_stable, "OOB"])
 })
-
-print(maxnodes_results)
 best_maxnodes_bag <- maxnodes_results$maxnodes[which.min(maxnodes_results$OOB_Error)]
-cat("Best maxnodes:", best_maxnodes_bag, "\n")
 
-ggplot(maxnodes_results, aes(x = maxnodes, y = OOB_Error)) +
-  geom_line(color = "steelblue", linewidth = 1) +
-  geom_point(color = "steelblue", size = 2.5) +
+p2 <- ggplot(maxnodes_results, aes(x = maxnodes, y = OOB_Error)) +
+  geom_line(color = "steelblue", linewidth = 1) + geom_point(color = "steelblue", size = 2.5) +
   geom_vline(xintercept = best_maxnodes_bag, linetype = "dashed", color = "red") +
-  labs(title    = "Bagging: OOB Error vs maxnodes",
-       subtitle = "Regularisation via maximum number of terminal nodes",
-       x = "maxnodes", y = "OOB Error") +
-  theme_minimal(base_size = 13)
+  labs(title = "OOB Error vs maxnodes", x = "maxnodes", y = "OOB Error") +
+  theme_minimal(base_size = 11)
+
+p1 + p2 + plot_annotation(title = "Bagging: Regularisation Tuning")
 ```
 
-OOB error decreases continuously as `maxnodes` increases, with the unrestricted setting achieving the lowest error. This confirms the finding from the `nodesize` search — for bagging, fully grown trees are optimal. Restricting tree depth via `maxnodes` consistently degrades performance, as it limits each tree's ability to fit the training data before averaging takes place.
+OOB error increases monotonically with `nodesize` -- best is `nodesize = `r best_nodesize_bag`` (fully grown trees). Similarly, unrestricted `maxnodes` achieves the lowest error. For bagging, variance reduction from averaging compensates for the high variance of individual deep trees, making regularisation counterproductive.
 
 ### Final Model
-```{r bag-final, echo=FALSE}
+
+```{r bag-final, fig.height=5.5}
 set.seed(42)
 mental_bag <- if (is.infinite(best_maxnodes_bag)) {
   randomForest(Has_Mental_Health_Issue ~ ., data = train_bag_data,
@@ -872,46 +629,56 @@ mental_bag <- if (is.infinite(best_maxnodes_bag)) {
                maxnodes = best_maxnodes_bag, importance = TRUE)
 }
 
-print(mental_bag)
+imp_bag <- as.data.frame(importance(mental_bag))
+imp_bag$Variable <- rownames(imp_bag)
 
-data.frame(
-  Measure = c("Model", "mtry (= p)", "ntree", "nodesize", "maxnodes"),
-  Value   = c("Bagging", p, ntree_stable, best_nodesize_bag,
-              ifelse(is.infinite(best_maxnodes_bag), "unrestricted", best_maxnodes_bag))
-) %>% print()
+p_acc <- ggplot(imp_bag %>% arrange(MeanDecreaseAccuracy) %>% tail(20),
+       aes(x = reorder(Variable, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_segment(aes(xend = Variable, y = 0, yend = MeanDecreaseAccuracy),
+               color = "steelblue", linewidth = 0.5) +
+  coord_flip() +
+  labs(title = "MeanDecreaseAccuracy", x = NULL, y = "Mean Decrease Accuracy") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.y = element_text(size = 7))
 
-varImpPlot(mental_bag, main = "Bagging: Variable Importance", cex = 0.8)
+p_gini <- ggplot(imp_bag %>% arrange(MeanDecreaseGini) %>% tail(20),
+       aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_segment(aes(xend = Variable, y = 0, yend = MeanDecreaseGini),
+               color = "steelblue", linewidth = 0.5) +
+  coord_flip() +
+  labs(title = "MeanDecreaseGini", x = NULL, y = "Mean Decrease Gini") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.y = element_text(size = 7))
+
+p_acc + p_gini + plot_annotation(title = "Bagging: Variable Importance")
 ```
 
-The variable importance plot confirms the findings from the single decision tree. `Social_Support` is the most important predictor by both MeanDecreaseAccuracy and MeanDecreaseGini, consistent with its role as the root split in the pruned tree. `Suicidal_Thoughts` and `Family_History_Mental_Illness` rank highly on MeanDecreaseAccuracy, reflecting their contribution to correct classification across all 353 trees. The ensemble importance scores are more reliable than those from a single tree, as they aggregate information across many bootstrap samples rather than reflecting a single realisation of the data.
+`Social_Support` is the most important predictor by both MeanDecreaseAccuracy and MeanDecreaseGini, consistent with its role as the root split in the pruned tree. `Suicidal_Thoughts` and `Family_History_Mental_Illness` also rank highly.
 
 ### Threshold Selection
-```{r bag-threshold, echo=FALSE}
-p_bag_val <- predict(mental_bag, newdata = val_bag_data, type = "prob")[, "Yes"]
 
+```{r bag-threshold, fig.height=4}
+p_bag_val        <- predict(mental_bag, newdata = val_bag_data, type = "prob")[, "Yes"]
 best_thr_bag_row <- pick_best_thr_bal(y_val_bag, p_bag_val)$best
 best_thr_bag     <- best_thr_bag_row$threshold
-
-print(best_thr_bag_row)
-
-all_thr_bag <- pick_best_thr_bal(y_val_bag, p_bag_val)$all
+all_thr_bag      <- pick_best_thr_bal(y_val_bag, p_bag_val)$all
 plot_threshold_effect_one(all_thr_bag, "Bagging", best_thr_bag)
 ```
 
-The threshold plot shows smooth, well-behaved curves — a direct consequence of bagging's smooth probability estimates, which are averages over 353 trees rather than the coarse leaf-proportion estimates of a single tree. The optimal threshold of 0.73 is higher than the default 0.50, reflecting the upward bias in predicted probabilities introduced by SMOTE on the training set. The selected threshold achieves a Balanced Accuracy of 0.606 on the validation set, with Sensitivity (0.589) and Specificity (0.624) reasonably balanced.
+The smooth threshold curves reflect bagging's well-averaged probability estimates. The optimal threshold of `r best_thr_bag` is higher than the default 0.50, reflecting upward probability bias introduced by SMOTE.
 
 ### Test Set Evaluation
-```{r bag-test, echo=FALSE}
-p_bag_test <- predict(mental_bag, newdata = test_bag_data, type = "prob")[, "Yes"]
 
+```{r bag-test, fig.width=10, fig.height=4.5}
+p_bag_test    <- predict(mental_bag, newdata = test_bag_data, type = "prob")[, "Yes"]
 pred_bag_test <- factor(ifelse(p_bag_test >= best_thr_bag, "Yes", "No"),
                         levels = c("No", "Yes"))
-
 cm_bag  <- confusionMatrix(pred_bag_test, y_test_bag, positive = "Yes")
 roc_bag <- roc(y_test_bag, p_bag_test, levels = c("No", "Yes"),
                direction = "<", quiet = TRUE)
 auc_bag <- as.numeric(auc(roc_bag))
-
 sens_bag <- as.numeric(cm_bag$byClass["Sensitivity"])
 spec_bag <- as.numeric(cm_bag$byClass["Specificity"])
 bal_bag  <- 0.5 * (sens_bag + spec_bag)
@@ -919,171 +686,110 @@ acc_bag  <- as.numeric(cm_bag$overall["Accuracy"])
 f1_bag   <- as.numeric(cm_bag$byClass["F1"])
 prec_bag <- as.numeric(cm_bag$byClass["Pos Pred Value"])
 
-bag_test_summary <- data.frame(
-  Model             = paste0("Bagging (ntree=", ntree_stable, ")"),
-  Test_AUC          = round(auc_bag,  3),
-  Balanced_Accuracy = round(bal_bag,  3),
-  Threshold         = round(best_thr_bag, 2),
-  Accuracy          = round(acc_bag,  3),
-  Sensitivity       = round(sens_bag, 3),
-  Specificity       = round(spec_bag, 3),
-  Precision         = round(prec_bag, 3),
-  F1                = round(f1_bag,   3)
-)
-print(bag_test_summary)
-
-cm_bag_table <- as.data.frame(cm_bag$table)
-colnames(cm_bag_table) <- c("Prediction", "Reference", "Count")
-print(cm_bag_table)
-
-ggroc(roc_bag, linewidth = 1, color = "steelblue") +
+p1 <- ggroc(roc_bag, linewidth = 1, color = "steelblue") +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
-  labs(title    = "Bagging ROC Curve",
-       subtitle = paste("AUC =", round(auc_bag, 3)),
+  labs(title = paste("Bagging ROC | AUC =", round(auc_bag, 3)),
        x = "Specificity", y = "Sensitivity") +
-  theme_minimal()
+  theme_minimal(base_size = 12)
 
 cm_bag_df <- as.data.frame(cm_bag$table)
 colnames(cm_bag_df) <- c("Prediction", "Reference", "Freq")
-
-ggplot(cm_bag_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+p2 <- ggplot(cm_bag_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
   scale_fill_gradient(low = "white", high = "steelblue") +
-  labs(title = paste0("Bagging Confusion Matrix (thr = ", best_thr_bag, ")"),
+  labs(title = paste0("Confusion Matrix (thr = ", best_thr_bag, ")"),
        x = "Actual", y = "Predicted") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none")
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p1 + p2
 
 bag_summary <- data.frame(
-  Model             = "Bagging",
-  Main_Setting      = paste0("mtry=p | ntree=", ntree_stable,
-                             " | nodesize=", best_nodesize_bag,
-                             " | maxnodes=", ifelse(is.infinite(best_maxnodes_bag),
-                                                    "unrestricted", best_maxnodes_bag)),
-  Threshold         = round(best_thr_bag, 2),
-  Test_AUC          = round(auc_bag,  3),
-  Balanced_Accuracy = round(bal_bag,  3),
-  Sensitivity       = round(sens_bag, 3),
-  Specificity       = round(spec_bag, 3)
+  Model = "Bagging",
+  Main_Setting = paste0("mtry=p | ntree=", ntree_stable, " | nodesize=",
+                         best_nodesize_bag, " | maxnodes=",
+                         ifelse(is.infinite(best_maxnodes_bag), "unrestricted",
+                                best_maxnodes_bag)),
+  Threshold = round(best_thr_bag, 2), Test_AUC = round(auc_bag, 3),
+  Balanced_Accuracy = round(bal_bag, 3), Sensitivity = round(sens_bag, 3),
+  Specificity = round(spec_bag, 3)
 )
-print(bag_summary)
 ```
 
-Bagging achieves a test AUC of 0.615, a modest but meaningful improvement over both the single decision tree (0.586) and k-NN (0.545). The ROC curve shows clearer lift above the diagonal compared to the single tree, confirming that aggregating 353 trees reduces variance and improves discriminative ability. The confusion matrix shows 1025 true positives and 90 true negatives, with 818 false negatives as the main source of error — the model still struggles to identify a substantial portion of the minority class.
+Bagging achieves test AUC of `r round(auc_bag, 3)`, a meaningful improvement over the single decision tree (`r round(auc_tree, 3)`). The improvement is real but limited -- because all predictors are considered at every split, individual trees are highly correlated. Random Forest addresses this directly.
 
-The improvement over a single tree is real but limited. Because bagging uses all predictors at every split, individual trees are highly correlated — they tend to make similar errors on the same observations. This limits the variance reduction from averaging. Random Forest addresses this directly by randomly subsampling predictors at each split, decorrelating the trees and achieving greater ensemble diversity.
-
-
-
-
-
+---
 
 ## **Random Forest**
 
-Random Forest extends Bagging by introducing an additional source of randomness at each split: instead of considering all $p$ predictors, only a random subset of `mtry` predictors is evaluated. This decorrelates the individual trees — when a strong predictor dominates every split in Bagging, the trees become highly correlated and averaging provides limited variance reduction. By restricting the candidate predictors at each split, Random Forest ensures that different trees rely on different features, producing a more diverse ensemble with greater variance reduction.
+Random Forest introduces an additional source of randomness: only a random subset of `mtry` predictors is evaluated at each split. This decorrelates the individual trees, producing a more diverse ensemble with greater variance reduction.
 
 ### Number of Trees
 
-As with Bagging, `ntree` was selected based on OOB error stabilisation rather than cross-validation. OOB error provides an unbiased estimate of generalisation error equivalent to leave-one-out cross-validation for bootstrap-based ensembles, making a separate CV pass unnecessary.
-```{r rf-ntree, echo=FALSE}
+```{r rf-ntree, fig.height=4}
 set.seed(42)
-mental_rf_ntree <- randomForest(
-  Has_Mental_Health_Issue ~ .,
-  data       = train_rf_data,
-  mtry       = floor(sqrt(p)),
-  ntree      = 500,
-  importance = TRUE
-)
-
-oob_df_rf <- tibble(
-  Trees     = seq_len(nrow(mental_rf_ntree$err.rate)),
-  OOB_Error = mental_rf_ntree$err.rate[, "OOB"]
-)
+mental_rf_ntree <- randomForest(Has_Mental_Health_Issue ~ ., data = train_rf_data,
+                                 mtry = floor(sqrt(p)), ntree = 500, importance = TRUE)
+oob_df_rf <- tibble(Trees = seq_len(nrow(mental_rf_ntree$err.rate)),
+                    OOB_Error = mental_rf_ntree$err.rate[, "OOB"])
+oob_min_rf      <- min(oob_df_rf$OOB_Error)
+ntree_stable_rf <- which(oob_df_rf$OOB_Error <= oob_min_rf * 1.01)[1]
 
 ggplot(oob_df_rf, aes(x = Trees, y = OOB_Error)) +
   geom_line(color = "#41ab5d", linewidth = 1) +
-  labs(title    = "Random Forest: OOB Error vs Number of Trees",
-       subtitle = "Used to determine stable ntree",
+  geom_vline(xintercept = ntree_stable_rf, linetype = "dashed", color = "red") +
+  annotate("text", x = ntree_stable_rf + 10, y = max(oob_df_rf$OOB_Error) * 0.95,
+           label = paste("stable =", ntree_stable_rf), color = "red", hjust = 0) +
+  labs(title = "Random Forest: OOB Error vs Number of Trees",
        x = "Number of Trees", y = "OOB Error") +
   theme_minimal(base_size = 13)
-
-oob_min_rf      <- min(oob_df_rf$OOB_Error)
-ntree_stable_rf <- which(oob_df_rf$OOB_Error <= oob_min_rf * 1.01)[1]
-cat("Stable ntree:", ntree_stable_rf, "\n")
 ```
 
-The OOB error drops sharply in the first 50 trees and continues to decline gradually, stabilising at tree 349. Random Forest stabilises faster than Bagging because the decorrelated trees converge more efficiently — each tree brings genuinely new information rather than a correlated variant of the same signal.
+OOB error stabilises at tree `r ntree_stable_rf` -- faster than Bagging because decorrelated trees converge more efficiently.
 
-### Hyperparameter Tuning: mtry
+### Hyperparameter Tuning: mtry, nodesize, maxnodes
 
-`mtry` is the key hyperparameter that distinguishes Random Forest from Bagging. A grid search was conducted around the default value of $\lfloor\sqrt{p}\rfloor = 7$, including smaller and larger values to fully characterise the OOB error curve.
-```{r rf-mtry, echo=FALSE}
+```{r rf-tuning, fig.width=10, fig.height=4}
 base_mtry <- floor(sqrt(p))
-mtry_grid <- sort(unique(pmax(1, pmin(p, c(
-  base_mtry - 2, base_mtry - 1, base_mtry,
-  base_mtry + 1, base_mtry + 2,
-  floor(p / 3), floor(p / 2)
-)))))
-
+mtry_grid <- sort(unique(pmax(1, pmin(p, c(base_mtry - 2, base_mtry - 1, base_mtry,
+                                            base_mtry + 1, base_mtry + 2,
+                                            floor(p/3), floor(p/2))))))
 mtry_results <- map_dfr(mtry_grid, function(m) {
   set.seed(42)
   fit <- randomForest(Has_Mental_Health_Issue ~ ., data = train_rf_data,
                       mtry = m, ntree = ntree_stable_rf)
   tibble(mtry = m, OOB_Error = fit$err.rate[ntree_stable_rf, "OOB"])
 })
-
-print(mtry_results)
 best_mtry_rf <- mtry_results$mtry[which.min(mtry_results$OOB_Error)]
-cat("Best mtry:", best_mtry_rf, "\n")
 
-ggplot(mtry_results, aes(x = mtry, y = OOB_Error)) +
+p1 <- ggplot(mtry_results, aes(x = mtry, y = OOB_Error)) +
   geom_line(color = "#41ab5d", linewidth = 1) +
   geom_point(color = "#41ab5d", size = 2.5) +
   geom_vline(xintercept = best_mtry_rf, linetype = "dashed", color = "red") +
-  annotate("text", x = best_mtry_rf + 0.3, y = max(mtry_results$OOB_Error),
+  annotate("text", x = best_mtry_rf + 0.5, y = max(mtry_results$OOB_Error),
            label = paste("best =", best_mtry_rf), color = "red", hjust = 0) +
-  labs(title    = "Random Forest: OOB Error vs mtry",
-       subtitle = "Number of predictors sampled at each split",
-       x = "mtry", y = "OOB Error") +
-  theme_minimal(base_size = 13)
-```
+  labs(title = "OOB Error vs mtry", x = "mtry", y = "OOB Error") +
+  theme_minimal(base_size = 11)
 
-OOB error increases monotonically as `mtry` grows beyond 5. This confirms that greater decorrelation — achieved by restricting the predictor pool at each split — benefits this dataset. The optimal `mtry = 5` is below the standard default of $\lfloor\sqrt{p}\rfloor = 7$, suggesting that the dataset contains several dominant predictors (such as `Social_Support`) that, if always available, would cause trees to correlate. Restricting to 5 candidates forces the ensemble to explore a broader range of feature combinations.
-
-### Regularisation: nodesize
-```{r rf-nodesize, echo=FALSE}
 nodesize_grid_rf <- c(1, 5, 10, 20, 30)
-
 nodesize_results_rf <- map_dfr(nodesize_grid_rf, function(ns) {
   set.seed(42)
   fit <- randomForest(Has_Mental_Health_Issue ~ ., data = train_rf_data,
                       mtry = best_mtry_rf, ntree = ntree_stable_rf, nodesize = ns)
   tibble(nodesize = ns, OOB_Error = fit$err.rate[ntree_stable_rf, "OOB"])
 })
-
-print(nodesize_results_rf)
 best_nodesize_rf <- nodesize_results_rf$nodesize[which.min(nodesize_results_rf$OOB_Error)]
-cat("Best nodesize:", best_nodesize_rf, "\n")
 
-ggplot(nodesize_results_rf, aes(x = nodesize, y = OOB_Error)) +
+p2 <- ggplot(nodesize_results_rf, aes(x = nodesize, y = OOB_Error)) +
   geom_line(color = "#41ab5d", linewidth = 1) +
   geom_point(color = "#41ab5d", size = 2.5) +
   geom_vline(xintercept = best_nodesize_rf, linetype = "dashed", color = "red") +
-  annotate("text", x = best_nodesize_rf + 0.5, y = max(nodesize_results_rf$OOB_Error),
-           label = paste("best =", best_nodesize_rf), color = "red", hjust = 0) +
-  labs(title    = "Random Forest: OOB Error vs nodesize",
-       subtitle = "Regularisation via minimum terminal node size",
-       x = "nodesize", y = "OOB Error") +
-  theme_minimal(base_size = 13)
-```
+  labs(title = "OOB Error vs nodesize", x = "nodesize", y = "OOB Error") +
+  theme_minimal(base_size = 11)
 
-As with Bagging, OOB error increases monotonically with `nodesize`. Fully grown trees (`nodesize = 1`) are optimal — the variance reduction from the ensemble averaging and the decorrelation from `mtry` are sufficient to control overfitting without additionally constraining individual tree depth.
+p1 + p2 + plot_annotation(title = "Random Forest: Hyperparameter Tuning")
 
-### Regularisation: maxnodes
-```{r rf-maxnodes, echo=FALSE}
 maxnodes_grid_rf <- list(10, 20, 50, 100, 200, NULL)
-
 maxnodes_results_rf <- map_dfr(seq_along(maxnodes_grid_rf), function(i) {
   mn <- maxnodes_grid_rf[[i]]
   set.seed(42)
@@ -1098,25 +804,14 @@ maxnodes_results_rf <- map_dfr(seq_along(maxnodes_grid_rf), function(i) {
   tibble(maxnodes = ifelse(is.null(mn), Inf, mn),
          OOB_Error = fit$err.rate[ntree_stable_rf, "OOB"])
 })
-
-print(maxnodes_results_rf)
 best_maxnodes_rf <- maxnodes_results_rf$maxnodes[which.min(maxnodes_results_rf$OOB_Error)]
-cat("Best maxnodes:", best_maxnodes_rf, "\n")
-
-ggplot(maxnodes_results_rf, aes(x = maxnodes, y = OOB_Error)) +
-  geom_line(color = "#41ab5d", linewidth = 1) +
-  geom_point(color = "#41ab5d", size = 2.5) +
-  geom_vline(xintercept = best_maxnodes_rf, linetype = "dashed", color = "red") +
-  labs(title    = "Random Forest: OOB Error vs maxnodes",
-       subtitle = "Regularisation via maximum number of terminal nodes",
-       x = "maxnodes", y = "OOB Error") +
-  theme_minimal(base_size = 13)
 ```
 
-Unrestricted trees are again optimal, consistent with the `nodesize` finding. The combination of `mtry = 5`, `nodesize = 1`, and unrestricted `maxnodes` produces the most accurate ensemble — deeper, more diverse trees that are decorrelated by the random predictor subsampling.
+The optimal `mtry = `r best_mtry_rf`` is below the standard default of $\lfloor\sqrt{p}\rfloor = `r floor(sqrt(p))`$. Dominant predictors like `Social_Support` cause correlation when always available -- restricting to `r best_mtry_rf` candidates forces the ensemble to explore a broader range of features. As with Bagging, `nodesize = 1` and unrestricted `maxnodes` are optimal.
 
 ### Final Model and Variable Importance
-```{r rf-final, echo=FALSE}
+
+```{r rf-final, fig.width=10, fig.height=5.5}
 set.seed(42)
 mental_rf <- if (is.infinite(best_maxnodes_rf)) {
   randomForest(Has_Mental_Health_Issue ~ ., data = train_rf_data,
@@ -1129,65 +824,50 @@ mental_rf <- if (is.infinite(best_maxnodes_rf)) {
                importance = TRUE)
 }
 
-print(mental_rf)
-
-data.frame(
-  Measure = c("Model", "mtry", "ntree", "nodesize", "maxnodes"),
-  Value   = c("Random Forest", best_mtry_rf, ntree_stable_rf, best_nodesize_rf,
-              ifelse(is.infinite(best_maxnodes_rf), "unrestricted", best_maxnodes_rf))
-) %>% print()
-
-varImpPlot(mental_rf, main = "Random Forest: Variable Importance", cex = 0.8)
-
 imp_df_rf <- as.data.frame(importance(mental_rf))
 imp_df_rf$Variable <- rownames(imp_df_rf)
 
-imp_long_rf <- imp_df_rf %>%
-  select(Variable, MeanDecreaseAccuracy, MeanDecreaseGini) %>%
-  pivot_longer(cols = -Variable, names_to = "Measure", values_to = "Importance")
+p_acc_rf <- ggplot(imp_df_rf %>% arrange(MeanDecreaseAccuracy) %>% tail(20),
+       aes(x = reorder(Variable, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "#41ab5d", alpha = 0.85) + coord_flip() +
+  labs(title = "MeanDecreaseAccuracy", x = NULL, y = "Mean Decrease Accuracy") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.y = element_text(size = 7))
 
-ggplot(imp_long_rf,
-       aes(x = fct_reorder(Variable, Importance), y = Importance, fill = Measure)) +
-  geom_col(position = "dodge", alpha = 0.85) +
-  coord_flip() +
-  facet_wrap(~ Measure, scales = "free_x") +
-  labs(title = "Random Forest: Variable Importance", x = NULL, y = "Importance") +
-  scale_fill_viridis_d() +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "none")
+p_gini_rf <- ggplot(imp_df_rf %>% arrange(MeanDecreaseGini) %>% tail(20),
+       aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col(fill = "#41ab5d", alpha = 0.85) + coord_flip() +
+  labs(title = "MeanDecreaseGini", x = NULL, y = "Mean Decrease Gini") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.y = element_text(size = 7))
+
+p_acc_rf + p_gini_rf + plot_annotation(title = "Random Forest: Variable Importance")
 ```
 
-The variable importance plot reveals a notable shift compared to Bagging. While `Social_Support` remains dominant on MeanDecreaseGini, the MeanDecreaseAccuracy ranking shows a more distributed importance profile — `Mood_Swings`, `Financial_Stress`, `Irritability`, and `Feeling_Worthless` all rank highly alongside `Social_Support`. This is a direct consequence of the `mtry = 5` constraint: because dominant predictors are not always available at every split, the ensemble is forced to exploit other informative features, producing a more balanced and reliable importance estimate. The Random Forest importance scores are therefore more trustworthy than those from a single tree or Bagging for characterising the true drivers of mental health issues in this dataset.
-
-The OOB error of 5.5% is substantially lower than Bagging's 6.73%, confirming that decorrelation meaningfully improves ensemble performance.
+The OOB error of `r round(mental_rf$err.rate[ntree_stable_rf, "OOB"] * 100, 1)`% is substantially lower than Bagging's `r round(mental_bag$err.rate[ntree_stable, "OOB"] * 100, 1)`%, confirming decorrelation improves ensemble performance. The `mtry = `r best_mtry_rf`` constraint forces exploration of a broader range of features, producing more distributed importance scores compared to Bagging.
 
 ### Threshold Selection
-```{r rf-threshold, echo=FALSE}
-p_rf_val <- predict(mental_rf, newdata = val_rf_data, type = "prob")[, "Yes"]
 
+```{r rf-threshold, fig.height=4}
+p_rf_val        <- predict(mental_rf, newdata = val_rf_data, type = "prob")[, "Yes"]
 best_thr_rf_row <- pick_best_thr_bal(y_val_rf, p_rf_val)$best
 best_thr_rf     <- best_thr_rf_row$threshold
-
-print(best_thr_rf_row)
-
-all_thr_rf <- pick_best_thr_bal(y_val_rf, p_rf_val)$all
+all_thr_rf      <- pick_best_thr_bal(y_val_rf, p_rf_val)$all
 plot_threshold_effect_one(all_thr_rf, "Random Forest", best_thr_rf)
 ```
 
-The threshold plot shows smooth, well-behaved curves with a clean crossover between Sensitivity and Specificity around the selected threshold of 0.68. This is lower than the Bagging threshold (0.73), suggesting that Random Forest's probability estimates are better calibrated — the decorrelation reduces the upward bias introduced by SMOTE, allowing the model to correctly assign lower probabilities to borderline cases.
+The optimal threshold of `r best_thr_rf` is lower than Bagging's (`r best_thr_bag`), suggesting better probability calibration -- decorrelation reduces the upward bias introduced by SMOTE.
 
 ### Test Set Evaluation
-```{r rf-test, echo=FALSE}
-p_rf_test <- predict(mental_rf, newdata = test_rf_data, type = "prob")[, "Yes"]
 
+```{r rf-test, fig.width=10, fig.height=4.5}
+p_rf_test    <- predict(mental_rf, newdata = test_rf_data, type = "prob")[, "Yes"]
 pred_rf_test <- factor(ifelse(p_rf_test >= best_thr_rf, "Yes", "No"),
                        levels = c("No", "Yes"))
-
 cm_rf  <- confusionMatrix(pred_rf_test, y_test_rf, positive = "Yes")
 roc_rf <- roc(y_test_rf, p_rf_test, levels = c("No", "Yes"),
               direction = "<", quiet = TRUE)
 auc_rf <- as.numeric(auc(roc_rf))
-
 sens_rf <- as.numeric(cm_rf$byClass["Sensitivity"])
 spec_rf <- as.numeric(cm_rf$byClass["Specificity"])
 bal_rf  <- 0.5 * (sens_rf + spec_rf)
@@ -1195,160 +875,108 @@ acc_rf  <- as.numeric(cm_rf$overall["Accuracy"])
 f1_rf   <- as.numeric(cm_rf$byClass["F1"])
 prec_rf <- as.numeric(cm_rf$byClass["Pos Pred Value"])
 
-rf_test_summary <- data.frame(
-  Model             = paste0("Random Forest (mtry=", best_mtry_rf, ")"),
-  Test_AUC          = round(auc_rf,  3),
-  Balanced_Accuracy = round(bal_rf,  3),
-  Threshold         = round(best_thr_rf, 2),
-  Accuracy          = round(acc_rf,  3),
-  Sensitivity       = round(sens_rf, 3),
-  Specificity       = round(spec_rf, 3),
-  Precision         = round(prec_rf, 3),
-  F1                = round(f1_rf,   3)
-)
-print(rf_test_summary)
-
-cm_rf_table <- as.data.frame(cm_rf$table)
-colnames(cm_rf_table) <- c("Prediction", "Reference", "Count")
-print(cm_rf_table)
-
-ggroc(roc_rf, linewidth = 1, color = "#41ab5d") +
+p1 <- ggroc(roc_rf, linewidth = 1, color = "#41ab5d") +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
-  labs(title    = "Random Forest ROC Curve",
-       subtitle = paste("AUC =", round(auc_rf, 3)),
+  labs(title = paste("Random Forest ROC | AUC =", round(auc_rf, 3)),
        x = "Specificity", y = "Sensitivity") +
-  theme_minimal()
+  theme_minimal(base_size = 12)
 
 cm_rf_df <- as.data.frame(cm_rf$table)
 colnames(cm_rf_df) <- c("Prediction", "Reference", "Freq")
-
-ggplot(cm_rf_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+p2 <- ggplot(cm_rf_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
   scale_fill_gradient(low = "white", high = "#41ab5d") +
-  labs(title = paste0("Random Forest Confusion Matrix (thr = ", best_thr_rf, ")"),
+  labs(title = paste0("Confusion Matrix (thr = ", best_thr_rf, ")"),
        x = "Actual", y = "Predicted") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none")
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p1 + p2
 
 rf_summary <- data.frame(
-  Model             = "Random Forest",
-  Main_Setting      = paste0("mtry=", best_mtry_rf,
-                             " | ntree=", ntree_stable_rf,
-                             " | nodesize=", best_nodesize_rf,
-                             " | maxnodes=", ifelse(is.infinite(best_maxnodes_rf),
-                                                    "unrestricted", best_maxnodes_rf)),
-  Threshold         = round(best_thr_rf, 2),
-  Test_AUC          = round(auc_rf,  3),
-  Balanced_Accuracy = round(bal_rf,  3),
-  Sensitivity       = round(sens_rf, 3),
-  Specificity       = round(spec_rf, 3)
+  Model = "Random Forest",
+  Main_Setting = paste0("mtry=", best_mtry_rf, " | ntree=", ntree_stable_rf,
+                         " | nodesize=", best_nodesize_rf, " | maxnodes=",
+                         ifelse(is.infinite(best_maxnodes_rf), "unrestricted",
+                                best_maxnodes_rf)),
+  Threshold = round(best_thr_rf, 2), Test_AUC = round(auc_rf, 3),
+  Balanced_Accuracy = round(bal_rf, 3), Sensitivity = round(sens_rf, 3),
+  Specificity = round(spec_rf, 3)
 )
-print(rf_summary)
 ```
 
-Random Forest achieves the best test AUC of 0.629 among all tree-based models — a clear improvement over both the single decision tree (0.586) and Bagging (0.615). The ROC curve shows consistent lift above the diagonal with no sharp discontinuities, reflecting the smooth and well-calibrated probability estimates produced by 349 decorrelated trees. The confusion matrix shows 1255 true positives and 80 true negatives, with 588 false negatives — a substantial reduction compared to both the single tree (860) and Bagging (818). Sensitivity improved markedly to 0.681, meaning the model now correctly identifies 68% of the minority class, up from 55.6% in Bagging.
+Random Forest achieves the best test AUC of `r round(auc_rf, 3)` among tree-based models. Sensitivity improved to `r round(sens_rf, 3)`, up from `r round(sens_bag, 3)` in Bagging -- the model now correctly identifies `r round(sens_rf * 100, 0)`% of the minority class. The progression Decision Tree (`r round(auc_tree, 3)`) → Bagging (`r round(auc_bag, 3)`) → Random Forest (`r round(auc_rf, 3)`) clearly demonstrates the ensemble learning principle.
 
-The progression from Decision Tree to Bagging to Random Forest demonstrates the ensemble learning principle clearly: each step reduces variance by aggregating more diverse models, with Random Forest's predictor subsampling providing the critical decorrelation that unlocks meaningful performance gains. That said, all three tree-based models remain in a similar AUC range (0.586–0.629), suggesting that the performance ceiling for this dataset may be limited by the signal available in the features rather than the choice of model.
-
-
-
-
-
+---
 
 ## **Support Vector Machine (SVM)**
 
-Support Vector Machines find the optimal hyperplane that maximises the margin between classes in the feature space. Unlike tree-based methods, SVMs are sensitive to feature scale and require standardised inputs — `prepare_data` was called with `scale = TRUE`. Three kernels were evaluated: Linear (baseline), Radial Basis Function (RBF), and Polynomial, following the approach recommended in the course material.
+Support Vector Machines find the optimal hyperplane that maximises the margin between classes. SVMs are sensitive to feature scale and require standardised inputs -- `prepare_data` was called with `scale = TRUE`. Three kernels were evaluated: Linear (baseline), Radial Basis Function, and Polynomial.
 
 ### Data Preparation
-```{r svm-prep, echo=FALSE}
-# Load pre-trained models and results — no retraining needed
-svm_linear         <- readRDS("svm_linear.rds")
-svm_radial         <- readRDS("svm_radial.rds")
-svm_poly           <- readRDS("svm_poly.rds")
-linear_results     <- readRDS("svm_linear_results.rds")
-radial_results     <- readRDS("svm_radial_results.rds")
-poly_results       <- readRDS("svm_poly_results.rds")
+
+```{r svm-prep}
+svm_linear          <- readRDS("svm_linear.rds")
+svm_radial          <- readRDS("svm_radial.rds")
+svm_poly            <- readRDS("svm_poly.rds")
+linear_results      <- readRDS("svm_linear_results.rds")
+radial_results      <- readRDS("svm_radial_results.rds")
+poly_results        <- readRDS("svm_poly_results.rds")
 svm_full_comparison <- readRDS("svm_full_comparison.rds")
-roc_linear_obj     <- readRDS("svm_roc_linear.rds")
-roc_radial_obj     <- readRDS("svm_roc_radial.rds")
-roc_poly_obj       <- readRDS("svm_roc_poly.rds")
+roc_linear_obj      <- readRDS("svm_roc_linear.rds")
+roc_radial_obj      <- readRDS("svm_roc_radial.rds")
+roc_poly_obj        <- readRDS("svm_roc_poly.rds")
 
 all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
-svm_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = TRUE)
-
-train_sc_svm <- svm_data$train
-val_sc_svm   <- svm_data$val
+svm_data     <- prepare_data(mental_train, mental_val, mental_test,
+                              all_features, scale = TRUE)
+train_sc_svm <- svm_data$train; val_sc_svm <- svm_data$val
 test_sc_svm  <- svm_data$test
-
-y_val_svm  <- val_sc_svm$Has_Mental_Health_Issue
-y_test_svm <- test_sc_svm$Has_Mental_Health_Issue
-
+y_val_svm    <- val_sc_svm$Has_Mental_Health_Issue
+y_test_svm   <- test_sc_svm$Has_Mental_Health_Issue
 best_kernel_name <- "Polynomial"
 best_svm         <- svm_poly
 ```
 
 ### Kernel Comparison via Cross-Validation
 
-Each kernel was tuned using 5-fold cross-validation with ROC-AUC as the evaluation metric. The regularisation parameter $C$ was tuned for all kernels; additionally, $\sigma$ (bandwidth) was tuned for the Radial kernel and degree $d$ for the Polynomial kernel.
+Each kernel was tuned using 5-fold CV with ROC-AUC as the evaluation metric. $C$ was tuned for all kernels; additionally $\sigma$ for Radial and degree $d$ for Polynomial.
 
-**Linear Kernel** — only $C$ was tuned over {0.01, 0.1, 1, 10}:
-```{r svm-linear-results, echo=FALSE}
+```{r svm-cv-tables}
 knitr::kable(linear_results, digits = 4,
              caption = "SVM Linear Kernel: 5-fold CV Results")
-```
-
-**Radial Kernel** — $C$ ∈ {0.1, 1, 10} and $\sigma$ ∈ {0.01, 0.1, 1}:
-```{r svm-radial-results, echo=FALSE}
 knitr::kable(radial_results, digits = 4,
              caption = "SVM Radial Kernel: 5-fold CV Results")
-```
-
-**Polynomial Kernel** — $C$ ∈ {0.1, 1, 10} and degree ∈ {2, 3, 4}:
-```{r svm-poly-results, echo=FALSE}
 knitr::kable(poly_results, digits = 4,
              caption = "SVM Polynomial Kernel: 5-fold CV Results")
-```
-
-**Kernel summary:**
-```{r svm-kernel-comparison, echo=FALSE}
 knitr::kable(svm_full_comparison, digits = 3,
              caption = "SVM Kernel Comparison: CV AUC vs Test AUC")
 ```
 
-By CV AUC, the Polynomial kernel with degree 4 and $C=0.1$ achieved the highest score (0.983), followed by Radial (0.971) and Linear (0.714). However, the CV-to-test gap tells a very different story — Radial and Polynomial both collapse on the test set (0.596 and 0.599 respectively), while Linear generalises far better (0.636). This is a textbook case of overfitting to the SMOTE-balanced training folds: the non-linear kernels learn highly complex boundaries that fit the synthetic minority class observations perfectly but fail to generalise to the true class distribution in the test set. The Linear kernel, constrained to a simple hyperplane, is less susceptible to this effect.
-
-Despite Polynomial winning by CV metric, **Linear is the better model in practice** — it has the highest test AUC and a far smaller CV-to-test gap (0.078 vs 0.372 for Polynomial). For the remainder of the evaluation, the Polynomial kernel is reported as the CV-selected model for methodological consistency, but this discrepancy is noted as a key finding.
+By CV AUC, the Polynomial kernel achieved the highest score (0.983), followed by Radial (0.971) and Linear (0.714). However, Radial and Polynomial collapse on the test set (0.596 and 0.599), while Linear generalises far better (0.636). The non-linear kernels overfit the SMOTE-balanced training folds. Despite Polynomial winning by CV metric, **Linear is the better model in practice**, with the highest test AUC and a CV-to-test gap of only 0.078 vs 0.372 for Polynomial.
 
 ### Threshold Selection
-```{r svm-threshold, echo=FALSE}
-p_svm_val <- predict(best_svm, newdata = val_sc_svm, type = "prob")[, "Yes"]
 
+```{r svm-threshold, fig.height=4}
+p_svm_val        <- predict(best_svm, newdata = val_sc_svm, type = "prob")[, "Yes"]
 best_thr_svm_row <- pick_best_thr_bal(y_val_svm, p_svm_val)$best
 best_thr_svm     <- best_thr_svm_row$threshold
-
-print(best_thr_svm_row)
-
-all_thr_svm <- pick_best_thr_bal(y_val_svm, p_svm_val)$all
+all_thr_svm      <- pick_best_thr_bal(y_val_svm, p_svm_val)$all
 plot_threshold_effect_one(all_thr_svm, "SVM - Polynomial Kernel", best_thr_svm)
 ```
 
-The threshold plot shows a heavily right-skewed structure — Sensitivity remains near 1.0 for most of the threshold range and only drops sharply above 0.90. This confirms that the Polynomial kernel assigns very high "Yes" probabilities to almost all observations, reflecting the overfitting to the SMOTE-balanced training distribution. The optimal threshold of 0.93 is selected to compensate, but this extreme value is itself a symptom of the model's poor calibration.
+The threshold plot shows a heavily right-skewed structure -- Sensitivity remains near 1.0 for most of the range and only drops sharply above 0.90. The Polynomial kernel assigns very high "Yes" probabilities to almost all observations, reflecting its overfitting to SMOTE-balanced training. The threshold of `r best_thr_svm` is itself a symptom of poor probability calibration.
 
 ### Test Set Evaluation
-```{r svm-test, echo=FALSE}
-p_svm_test <- predict(best_svm, newdata = test_sc_svm, type = "prob")[, "Yes"]
 
-pred_svm_test <- factor(
-  ifelse(p_svm_test >= best_thr_svm, "Yes", "No"),
-  levels = c("No", "Yes")
-)
-
+```{r svm-test, fig.width=10, fig.height=4.5}
+p_svm_test    <- predict(best_svm, newdata = test_sc_svm, type = "prob")[, "Yes"]
+pred_svm_test <- factor(ifelse(p_svm_test >= best_thr_svm, "Yes", "No"),
+                        levels = c("No", "Yes"))
 cm_svm  <- confusionMatrix(pred_svm_test, y_test_svm, positive = "Yes")
 roc_svm <- roc(y_test_svm, p_svm_test, levels = c("No", "Yes"),
                direction = "<", quiet = TRUE)
 auc_svm <- as.numeric(auc(roc_svm))
-
 sens_svm <- as.numeric(cm_svm$byClass["Sensitivity"])
 spec_svm <- as.numeric(cm_svm$byClass["Specificity"])
 bal_svm  <- 0.5 * (sens_svm + spec_svm)
@@ -1356,264 +984,187 @@ acc_svm  <- as.numeric(cm_svm$overall["Accuracy"])
 f1_svm   <- as.numeric(cm_svm$byClass["F1"])
 prec_svm <- as.numeric(cm_svm$byClass["Pos Pred Value"])
 
-svm_test_summary <- data.frame(
-  Model             = paste0("SVM (", best_kernel_name, " kernel)"),
-  Test_AUC          = round(auc_svm,  3),
-  Balanced_Accuracy = round(bal_svm,  3),
-  Threshold         = round(best_thr_svm, 2),
-  Accuracy          = round(acc_svm,  3),
-  Sensitivity       = round(sens_svm, 3),
-  Specificity       = round(spec_svm, 3),
-  Precision         = round(prec_svm, 3),
-  F1                = round(f1_svm,   3)
-)
-print(svm_test_summary)
-
-cm_svm_df <- as.data.frame(cm_svm$table)
-colnames(cm_svm_df) <- c("Prediction", "Reference", "Freq")
-
-ggplot(cm_svm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
-  geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
-  scale_fill_gradient(low = "white", high = "purple") +
-  labs(
-    title = paste0("SVM Confusion Matrix - ", best_kernel_name,
-                   " Kernel (thr = ", best_thr_svm, ")"),
-    x = "Actual", y = "Predicted"
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none")
-
-# Combined ROC curves
-ggroc(list(Linear = roc_linear_obj,
-           Radial = roc_radial_obj,
-           Polynomial = roc_poly_obj),
+ggroc(list(Linear = roc_linear_obj, Radial = roc_radial_obj, Polynomial = roc_poly_obj),
       linewidth = 1) +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
   scale_color_manual(
     values = c("Linear" = "steelblue", "Radial" = "#41ab5d", "Polynomial" = "purple"),
-    labels = c(
-      paste0("Linear (AUC=",     round(as.numeric(auc(roc_linear_obj)), 3), ")"),
-      paste0("Radial (AUC=",     round(as.numeric(auc(roc_radial_obj)), 3), ")"),
-      paste0("Polynomial (AUC=", round(as.numeric(auc(roc_poly_obj)),   3), ")")
-    )
-  ) +
-  labs(
-    title    = "SVM: ROC Curves by Kernel",
-    subtitle = "Test set evaluation",
-    x = "Specificity", y = "Sensitivity",
-    color = "Kernel"
-  ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
+    labels = c(paste0("Linear (AUC=", round(as.numeric(auc(roc_linear_obj)), 3), ")"),
+               paste0("Radial (AUC=", round(as.numeric(auc(roc_radial_obj)), 3), ")"),
+               paste0("Polynomial (AUC=", round(as.numeric(auc(roc_poly_obj)), 3), ")"))) +
+  labs(title = "SVM: ROC Curves by Kernel", subtitle = "Test set evaluation",
+       x = "Specificity", y = "Sensitivity", color = "Kernel") +
+  theme_minimal(base_size = 13) + theme(legend.position = "bottom")
+
+cm_svm_df <- as.data.frame(cm_svm$table)
+colnames(cm_svm_df) <- c("Prediction", "Reference", "Freq")
+ggplot(cm_svm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "purple") +
+  labs(title = paste0("SVM Confusion Matrix - Polynomial Kernel (thr = ", best_thr_svm, ")"),
+       x = "Actual", y = "Predicted") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
 
 svm_summary <- data.frame(
-  Model             = "SVM (Linear)",
-  Main_Setting      = paste0("kernel=Linear | C=", svm_linear$bestTune$C),
-  Threshold         = round(best_thr_svm, 2),
-  Test_AUC          = round(as.numeric(auc(roc_linear_obj)), 3),
+  Model = "SVM (Linear)",
+  Main_Setting = paste0("kernel=Linear | C=", svm_linear$bestTune$C),
+  Threshold = round(best_thr_svm, 2),
+  Test_AUC = round(as.numeric(auc(roc_linear_obj)), 3),
   Balanced_Accuracy = round(bal_svm, 3),
-  Sensitivity       = round(sens_svm, 3),
-  Specificity       = round(spec_svm, 3)
+  Sensitivity = round(sens_svm, 3),
+  Specificity = round(spec_svm, 3)
 )
-print(svm_summary)
 ```
 
-The combined ROC plot confirms that Linear kernel generalises best on the test set despite losing the CV comparison. The Polynomial and Radial curves hug the diagonal in the low-specificity region, reflecting their inability to distinguish the minority class reliably. The key takeaway is that CV metric alone is an unreliable guide when SMOTE creates an artificial training distribution — model selection should always be validated against a held-out test set with the true class distribution.
+The combined ROC plot confirms that the Linear kernel generalises best on the test set despite losing the CV comparison. The Polynomial and Radial curves hug the diagonal in the low-specificity region -- CV metric alone is an unreliable guide when SMOTE creates an artificial training distribution.
 
-
-
-
-
+---
 
 ## **Neural Network**
 
-Neural networks learn hierarchical representations of the data by composing multiple layers of non-linear transformations. Unlike the tree-based and kernel-based models evaluated previously, a neural network can in principle capture complex interactions between features without explicit specification. However, this flexibility comes at the cost of higher variance and a greater risk of overfitting — particularly on tabular datasets with moderate signal. Regularisation through dropout and batch normalisation, combined with early stopping, is therefore critical.
+Neural networks learn hierarchical representations through multiple layers of non-linear transformations. This flexibility comes at the cost of higher variance and greater overfitting risk -- particularly on tabular datasets with moderate signal. Regularisation through dropout and batch normalisation, combined with early stopping, is therefore critical.
 
 ### Data Preparation
 
-Neural networks are sensitive to feature scale and require standardised inputs. `prepare_data` was called with `scale = TRUE`, applying SMOTE to balance the training set and standardising all numeric predictors. Categorical variables were converted to dummy variables via `model.matrix`, producing a 76-feature numeric matrix.
-```{r nn-prep, echo=FALSE}
+`prepare_data` was called with `scale = TRUE`. Categorical variables were converted to dummy variables via `model.matrix`, producing a 76-feature numeric matrix.
+
+```{r nn-prep}
 library(keras3)
-
 all_features <- setdiff(names(mental_train), "Has_Mental_Health_Issue")
-nn_data <- prepare_data(mental_train, mental_val, mental_test, all_features, scale = TRUE)
-
-train_sc_nn <- nn_data$train
-val_sc_nn   <- nn_data$val
-test_sc_nn  <- nn_data$test
-
-y_val_nn  <- val_sc_nn$Has_Mental_Health_Issue
-y_test_nn <- test_sc_nn$Has_Mental_Health_Issue
+nn_data      <- prepare_data(mental_train, mental_val, mental_test,
+                              all_features, scale = TRUE)
+train_sc_nn  <- nn_data$train; val_sc_nn <- nn_data$val; test_sc_nn <- nn_data$test
+y_val_nn     <- val_sc_nn$Has_Mental_Health_Issue
+y_test_nn    <- test_sc_nn$Has_Mental_Health_Issue
 
 prep_nn_matrix <- function(df) {
   df_dummy <- model.matrix(Has_Mental_Health_Issue ~ ., data = df)[, -1]
   label    <- as.numeric(df$Has_Mental_Health_Issue == "Yes")
   list(x = df_dummy, y = label)
 }
-
-train_nn <- prep_nn_matrix(train_sc_nn)
-val_nn   <- prep_nn_matrix(val_sc_nn)
+train_nn <- prep_nn_matrix(train_sc_nn); val_nn <- prep_nn_matrix(val_sc_nn)
 test_nn  <- prep_nn_matrix(test_sc_nn)
-
 n_features <- ncol(train_nn$x)
-cat("Features:", n_features, "\n")
-cat("Training rows:", nrow(train_nn$x), "\n")
 ```
 
 ### Architecture
 
-A funnel architecture was used: each additional hidden layer has half the units of the previous one, progressively compressing the representation. Every hidden layer is followed by batch normalisation (to stabilise training) and dropout (to regularise). The output layer uses a sigmoid activation for binary classification.
-```{r nn-build, echo=FALSE}
+A funnel architecture was used: each additional hidden layer has half the units of the previous one. Every hidden layer is followed by batch normalisation and dropout. The output layer uses sigmoid activation.
+
+```{r nn-build}
 build_nn <- function(n_layers, units, dropout, lr, n_features) {
-  model <- keras_model_sequential()
-  model <- model %>%
+  model <- keras_model_sequential() %>%
     layer_dense(units = units, activation = "relu", input_shape = n_features) %>%
-    layer_batch_normalization() %>%
-    layer_dropout(rate = dropout)
+    layer_batch_normalization() %>% layer_dropout(rate = dropout)
   if (n_layers > 1) {
     for (l in 2:n_layers) {
       units_l <- max(8, units / (2^(l-1)))
       model <- model %>%
         layer_dense(units = units_l, activation = "relu") %>%
-        layer_batch_normalization() %>%
-        layer_dropout(rate = dropout)
+        layer_batch_normalization() %>% layer_dropout(rate = dropout)
     }
   }
   model <- model %>% layer_dense(units = 1, activation = "sigmoid")
-  model %>% compile(
-    optimizer = optimizer_adam(learning_rate = lr),
-    loss      = "binary_crossentropy",
-    metrics   = list(metric_auc(name = "auc"))
-  )
+  model %>% compile(optimizer = optimizer_adam(learning_rate = lr),
+                    loss = "binary_crossentropy",
+                    metrics = list(metric_auc(name = "auc")))
   model
 }
 ```
 
 ### Hyperparameter Tuning
 
-A grid search was performed over four hyperparameters: number of hidden layers ∈ {1, 2, 3}, units in the first layer ∈ {16, 32, 64, 128}, dropout rate ∈ {0.2, 0.4}, and learning rate ∈ {0.0001, 0.001, 0.01} — 54 combinations in total. Each combination was trained with early stopping (patience = 10, monitored on validation AUC) to prevent overfitting and ensure fair comparison. Combinations that stopped before epoch 5 were excluded from selection, as these reflect unstable training rather than genuine optimisation.
-```{r nn-grid, echo=FALSE}
+A grid search was performed over 54 combinations: layers in {1,2,3}, units in {16,32,64,128}, dropout in {0.2,0.4}, learning rate in {0.0001,0.001,0.01}. Each combination was trained with early stopping (patience=10, monitoring validation AUC). Combinations stopping before epoch 5 were excluded as unstable.
+
+```{r nn-grid, fig.width=10, fig.height=5.5}
 nn_grid_results <- readRDS("nn_grid_results.rds")
 best_nn_params  <- readRDS("nn_best_params.rds")
-
-print(nn_grid_results %>% arrange(desc(val_AUC)))
-print(best_nn_params)
 
 ggplot(nn_grid_results,
        aes(x = factor(units), y = val_AUC,
            color = factor(dropout), group = factor(dropout))) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
   facet_grid(n_layers ~ lr, labeller = label_both) +
   scale_color_manual(values = c("0.2" = "steelblue", "0.4" = "tomato")) +
-  labs(
-    title    = "Neural Network: Grid Search Results",
-    subtitle = "Validation AUC across hyperparameter combinations",
-    x = "Units", y = "Validation AUC", color = "Dropout"
-  ) +
-  theme_minimal(base_size = 11) +
-  theme(legend.position = "bottom")
+  labs(title    = "Neural Network: Grid Search Results",
+       subtitle = "Validation AUC across hyperparameter combinations",
+       x = "Units", y = "Validation AUC", color = "Dropout") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
 ```
 
-The grid search reveals several consistent patterns. Dropout = 0.4 outperforms 0.2 across nearly all combinations, confirming that stronger regularisation is beneficial for this dataset. Shallow networks (1 layer) tend to perform as well as or better than deeper ones — the signal in the data is relatively simple and does not require deep hierarchical representations. Learning rate = 0.01 produces unstable training for larger networks (many combinations stop at epoch 1), which motivated the minimum epoch filter. The best combination is a single hidden layer with 128 units, dropout = 0.4, and learning rate = 0.0001.
+Dropout=0.4 outperforms 0.2 across nearly all combinations -- stronger regularisation is beneficial. Shallow networks (1 layer) perform as well as or better than deeper ones. The best combination is a single hidden layer with `r best_nn_params$units` units, dropout=`r best_nn_params$dropout`, and learning rate=`r best_nn_params$lr`.
 
 ### Final Model and Training Curves
-```{r nn-final, echo=FALSE}
-set.seed(42)
-keras3::set_random_seed(42)
 
-nn_final <- build_nn(
-  n_layers   = best_nn_params$n_layers,
-  units      = best_nn_params$units,
-  dropout    = best_nn_params$dropout,
-  lr         = best_nn_params$lr,
-  n_features = n_features
-)
-
-summary(nn_final)
-
+```{r nn-final, results='hide'}
+set.seed(42); keras3::set_random_seed(42)
+nn_final <- build_nn(n_layers = best_nn_params$n_layers, units = best_nn_params$units,
+                     dropout = best_nn_params$dropout, lr = best_nn_params$lr,
+                     n_features = n_features)
 history_final <- nn_final %>% fit(
-  x               = train_nn$x,
-  y               = train_nn$y,
-  epochs          = 200,
-  batch_size      = 64,
+  x = train_nn$x, y = train_nn$y, epochs = 200, batch_size = 64,
   validation_data = list(val_nn$x, val_nn$y),
-  callbacks       = list(
-    callback_early_stopping(
-      monitor              = "val_auc",
-      patience             = 15,
-      mode                 = "max",
-      restore_best_weights = TRUE
-    )
-  ),
-  verbose = 0
-)
-
+  callbacks = list(callback_early_stopping(monitor = "val_auc", patience = 15,
+                                            mode = "max", restore_best_weights = TRUE)),
+  verbose = 0)
 history_df <- data.frame(
   epoch      = seq_along(history_final$metrics$auc),
   train_auc  = history_final$metrics$auc,
   val_auc    = history_final$metrics$val_auc,
   train_loss = history_final$metrics$loss,
-  val_loss   = history_final$metrics$val_loss
-)
+  val_loss   = history_final$metrics$val_loss)
+```
 
-# AUC curve
-ggplot(history_df %>% pivot_longer(cols = c(train_auc, val_auc),
-                                   names_to = "set", values_to = "AUC"),
-       aes(x = epoch, y = AUC, color = set)) +
+```{r nn-curves, fig.width=10, fig.height=4.5}
+p1 <- ggplot(history_df %>% pivot_longer(cols = c(train_auc, val_auc),
+                                         names_to = "set", values_to = "AUC"),
+             aes(x = epoch, y = AUC, color = set)) +
   geom_line(linewidth = 1) +
   scale_color_manual(values = c("train_auc" = "steelblue", "val_auc" = "tomato"),
                      labels = c("Train", "Validation")) +
-  labs(title    = "Neural Network: Training Curve (AUC)",
-       subtitle = paste("Best val AUC =", round(max(history_df$val_auc), 4)),
-       x = "Epoch", y = "AUC", color = "") +
-  theme_minimal(base_size = 13)
+  labs(title = "Training Curve (AUC)", x = "Epoch", y = "AUC", color = "") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
 
-# Loss curve
-ggplot(history_df %>% pivot_longer(cols = c(train_loss, val_loss),
-                                   names_to = "set", values_to = "Loss"),
-       aes(x = epoch, y = Loss, color = set)) +
+p2 <- ggplot(history_df %>% pivot_longer(cols = c(train_loss, val_loss),
+                                         names_to = "set", values_to = "Loss"),
+             aes(x = epoch, y = Loss, color = set)) +
   geom_line(linewidth = 1) +
   scale_color_manual(values = c("train_loss" = "steelblue", "val_loss" = "tomato"),
                      labels = c("Train", "Validation")) +
-  labs(title    = "Neural Network: Training Curve (Loss)",
-       subtitle = "Early stopping applied — best weights restored",
-       x = "Epoch", y = "Loss", color = "") +
-  theme_minimal(base_size = 13)
+  labs(title = "Training Curve (Loss)", x = "Epoch", y = "Loss", color = "") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+p1 + p2 + plot_annotation(
+  title    = "Neural Network: Training Curves",
+  subtitle = paste("Best val AUC =", round(max(history_df$val_auc), 4),
+                   "| Early stopping applied -- best weights restored"))
 ```
 
-The AUC training curve shows a clean learning pattern: both train and validation AUC rise together in the first 8 epochs, after which validation AUC plateaus at approximately 0.689 while train AUC continues to increase — a classic early overfitting signal. Early stopping correctly identifies this plateau and restores the weights from epoch 12, where validation AUC was highest. The loss curves are smooth and monotonically decreasing with no instability, confirming that the learning rate of 0.0001 is appropriate for this architecture.
+Both AUC curves rise together in the first 8 epochs, after which validation AUC plateaus while train AUC continues to increase -- a classic early overfitting signal. Early stopping correctly identifies this plateau and restores weights from epoch 12. The loss curves are smooth with no instability, confirming the learning rate is appropriate.
 
 ### Threshold Selection
-```{r nn-threshold, echo=FALSE}
-p_nn_val <- as.numeric(predict(nn_final, val_nn$x))
 
+```{r nn-threshold, fig.height=4, results='hide'}
+p_nn_val        <- as.numeric(predict(nn_final, val_nn$x))
 best_thr_nn_row <- pick_best_thr_bal(y_val_nn, p_nn_val)$best
 best_thr_nn     <- best_thr_nn_row$threshold
-
-print(best_thr_nn_row)
-
-all_thr_nn <- pick_best_thr_bal(y_val_nn, p_nn_val)$all
+all_thr_nn      <- pick_best_thr_bal(y_val_nn, p_nn_val)$all
 plot_threshold_effect_one(all_thr_nn, "Neural Network", best_thr_nn)
 ```
 
-The threshold plot shows smooth, well-behaved curves with a clean crossover between Sensitivity and Specificity near the selected threshold of 0.45. Notably, this is the closest to the default 0.50 among all models evaluated — reflecting that the neural network produces better-calibrated probability estimates than the tree-based or kernel-based models, which all required thresholds above 0.57. This is a consequence of the sigmoid output and binary cross-entropy loss, which directly optimise probability calibration.
+The threshold of `r best_thr_nn` is the closest to 0.50 among all models -- reflecting that sigmoid output and binary cross-entropy loss directly optimise probability calibration. The smooth crossover at `r best_thr_nn` confirms well-behaved probability estimates.
 
 ### Test Set Evaluation
-```{r nn-test, echo=FALSE}
-p_nn_test <- as.numeric(predict(nn_final, test_nn$x))
 
-pred_nn_test <- factor(
-  ifelse(p_nn_test >= best_thr_nn, "Yes", "No"),
-  levels = c("No", "Yes")
-)
-
+```{r nn-test, fig.width=10, fig.height=4.5, results='hide'}
+p_nn_test    <- as.numeric(predict(nn_final, test_nn$x))
+pred_nn_test <- factor(ifelse(p_nn_test >= best_thr_nn, "Yes", "No"),
+                       levels = c("No", "Yes"))
 cm_nn  <- confusionMatrix(pred_nn_test, y_test_nn, positive = "Yes")
 roc_nn <- roc(y_test_nn, p_nn_test, levels = c("No", "Yes"),
               direction = "<", quiet = TRUE)
 auc_nn <- as.numeric(auc(roc_nn))
-
 sens_nn <- as.numeric(cm_nn$byClass["Sensitivity"])
 spec_nn <- as.numeric(cm_nn$byClass["Specificity"])
 bal_nn  <- 0.5 * (sens_nn + spec_nn)
@@ -1621,247 +1172,202 @@ acc_nn  <- as.numeric(cm_nn$overall["Accuracy"])
 f1_nn   <- as.numeric(cm_nn$byClass["F1"])
 prec_nn <- as.numeric(cm_nn$byClass["Pos Pred Value"])
 
-nn_test_summary <- data.frame(
-  Model             = paste0("Neural Network (", best_nn_params$n_layers,
-                             "L-", best_nn_params$units, "u)"),
-  Test_AUC          = round(auc_nn,  3),
-  Balanced_Accuracy = round(bal_nn,  3),
-  Threshold         = round(best_thr_nn, 2),
-  Accuracy          = round(acc_nn,  3),
-  Sensitivity       = round(sens_nn, 3),
-  Specificity       = round(spec_nn, 3),
-  Precision         = round(prec_nn, 3),
-  F1                = round(f1_nn,   3)
-)
-print(nn_test_summary)
-
-cm_nn_table <- as.data.frame(cm_nn$table)
-colnames(cm_nn_table) <- c("Prediction", "Reference", "Count")
-print(cm_nn_table)
-
-ggroc(roc_nn, linewidth = 1, color = "#e74c3c") +
+p1 <- ggroc(roc_nn, linewidth = 1, color = "#e74c3c") +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
-  labs(title    = "Neural Network ROC Curve",
-       subtitle = paste("AUC =", round(auc_nn, 3)),
+  labs(title = paste("Neural Network ROC | AUC =", round(auc_nn, 3)),
        x = "Specificity", y = "Sensitivity") +
-  theme_minimal()
+  theme_minimal(base_size = 12)
 
 cm_nn_df <- as.data.frame(cm_nn$table)
 colnames(cm_nn_df) <- c("Prediction", "Reference", "Freq")
-
-ggplot(cm_nn_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+p2 <- ggplot(cm_nn_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
   scale_fill_gradient(low = "white", high = "#e74c3c") +
-  labs(title = paste0("Neural Network Confusion Matrix (thr = ", best_thr_nn, ")"),
+  labs(title = paste0("Confusion Matrix (thr = ", best_thr_nn, ")"),
        x = "Actual", y = "Predicted") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none")
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p1 + p2
 
 nn_summary <- data.frame(
-  Model             = "Neural Network",
-  Main_Setting      = paste0(best_nn_params$n_layers, " layers | units=",
-                             best_nn_params$units, " | dropout=",
-                             best_nn_params$dropout, " | lr=", best_nn_params$lr),
-  Threshold         = round(best_thr_nn, 2),
-  Test_AUC          = round(auc_nn,  3),
-  Balanced_Accuracy = round(bal_nn,  3),
-  Sensitivity       = round(sens_nn, 3),
-  Specificity       = round(spec_nn, 3)
+  Model = "Neural Network",
+  Main_Setting = paste0(best_nn_params$n_layers, " layers | units=", best_nn_params$units,
+                         " | dropout=", best_nn_params$dropout, " | lr=", best_nn_params$lr),
+  Threshold = round(best_thr_nn, 2), Test_AUC = round(auc_nn, 3),
+  Balanced_Accuracy = round(bal_nn, 3), Sensitivity = round(sens_nn, 3),
+  Specificity = round(spec_nn, 3)
 )
-print(nn_summary)
-
-# Save
-nn_final %>% save_model("nn_final.keras")
-saveRDS(history_df,      "nn_history.rds")
-saveRDS(roc_nn,          "nn_roc.rds")
-saveRDS(nn_test_summary, "nn_test_summary.rds")
-saveRDS(nn_summary,      "nn_summary.rds")
-saveRDS(best_thr_nn,     "nn_best_thr.rds")
-saveRDS(p_nn_test,       "nn_probs_test.rds")
 ```
 
-The neural network achieves a test AUC of 0.623, placing it between Bagging (0.615) and Random Forest (0.629). The ROC curve shows consistent lift above the diagonal with a notable step around specificity = 0.50, reflecting the model's stronger discrimination in the mid-range of the probability space. The confusion matrix shows 1245 true positives and 83 true negatives, with 598 false negatives — a meaningful improvement over all tree-based models in terms of false negative reduction.
-
-The threshold of 0.45 is the most clinically interpretable of all models — close to 0.50, well-calibrated, and producing a balanced sensitivity (0.676) and specificity (0.532). The Balanced Accuracy of 0.604 is the second highest among all models after Random Forest (0.597), confirming that the neural network generalises well despite the SMOTE-induced training distribution shift. The performance gap between validation AUC (0.689) and test AUC (0.623) is present but smaller than in the SVM models, suggesting that the neural network's smooth probability outputs are more robust to the class distribution mismatch.
-
+The neural network achieves test AUC of `r round(auc_nn, 3)`, placing it between Bagging and Random Forest. The Balanced Accuracy of `r round(bal_nn, 3)` is the highest among all models. The validation-to-test gap (0.689 vs `r round(auc_nn, 3)`) is smaller than in the SVM models, suggesting the neural network's smooth probability outputs are more robust to class distribution mismatch.
 
 ### Explainability: Layer-wise Relevance Propagation (LRP)
 
-Neural networks are inherently black-box models — their predictions emerge from complex non-linear transformations across multiple layers, making it difficult to understand which features drive individual decisions. To address this, Layer-wise Relevance Propagation (LRP) was applied to decompose the network's predictions back to input feature contributions.
+Neural networks are inherently black-box models. To address this, Layer-wise Relevance Propagation (LRP) was applied to decompose predictions back to input feature contributions. LRP backpropagates the prediction score through the network, redistributing relevance according to each neuron's contribution. The epsilon rule was used to stabilise the decomposition. Unlike SHAP -- which requires expensive Monte Carlo sampling -- LRP is gradient-based and runs in seconds.
 
-LRP backpropagates the prediction score through the network layer by layer, redistributing relevance according to each neuron's contribution to the output. The epsilon rule was used to stabilise the decomposition and avoid division by zero. Unlike SHAP — which requires expensive Monte Carlo sampling — LRP is gradient-based and runs in seconds, making it well-suited for neural networks.
-```{r nn-lrp, echo=FALSE}
+```{r nn-lrp, fig.width=9, fig.height=5, results='hide'}
 lrp_epsilon <- function(model, x_input, epsilon = 0.01) {
   w1 <- model$layers[[1]]$get_weights()[[1]]
   b1 <- model$layers[[1]]$get_weights()[[2]]
   w2 <- model$layers[[4]]$get_weights()[[1]]
   b2 <- model$layers[[4]]$get_weights()[[2]]
-  
   z1  <- x_input %*% w1 + matrix(b1, nrow(x_input), length(b1), byrow = TRUE)
   a1  <- pmax(z1, 0)
   z2  <- a1 %*% w2 + matrix(b2, nrow(a1), length(b2), byrow = TRUE)
   out <- 1 / (1 + exp(-z2))
-  
   R2     <- as.vector(out)
   z2_eps <- a1 %*% w2
   z2_eps <- z2_eps + epsilon * ifelse(z2_eps >= 0, 1, -1)
   z2_eps[z2_eps == 0] <- epsilon
-  
   R1 <- a1 * matrix(as.vector(w2), nrow(a1), ncol(a1), byrow = TRUE) *
         matrix(R2 / as.vector(z2_eps), nrow(a1), ncol(a1))
-  
   z1_eps <- x_input %*% w1
   z1_eps <- z1_eps + epsilon * ifelse(z1_eps >= 0, 1, -1)
   z1_eps[z1_eps == 0] <- epsilon
-  
-  R0 <- x_input * ((R1 / z1_eps) %*% t(w1))
-  R0
+  x_input * ((R1 / z1_eps) %*% t(w1))
 }
 
 set.seed(42)
-sample_idx <- sample(nrow(test_nn$x), 200)
-x_sample   <- test_nn$x[sample_idx, ]
-lrp_scores <- lrp_epsilon(nn_final, x_sample)
-
+sample_idx     <- sample(nrow(test_nn$x), 200)
+x_sample       <- test_nn$x[sample_idx, ]
+lrp_scores     <- lrp_epsilon(nn_final, x_sample)
 feature_names  <- colnames(test_nn$x)
 mean_relevance <- colMeans(abs(lrp_scores))
 
-lrp_df <- data.frame(
-  Feature   = feature_names,
-  Relevance = mean_relevance
-) %>%
-  arrange(desc(Relevance)) %>%
-  slice(1:20)
+lrp_df <- data.frame(Feature = feature_names, Relevance = mean_relevance) %>%
+  arrange(desc(Relevance)) %>% slice(1:20)
 
-# Global importance plot
 ggplot(lrp_df, aes(x = reorder(Feature, Relevance), y = Relevance)) +
-  geom_col(fill = "#e74c3c", alpha = 0.85) +
-  coord_flip() +
+  geom_col(fill = "#e74c3c", alpha = 0.85) + coord_flip() +
   labs(title    = "Neural Network: LRP Feature Relevance",
-       subtitle = "Top 20 features — mean absolute relevance on test set (n=200)",
+       subtitle = "Top 20 features - mean absolute relevance on test set (n=200)",
        x = NULL, y = "Mean Absolute Relevance") +
-  theme_minimal(base_size = 13)
+  theme_minimal(base_size = 11) +
+  theme(axis.text.y = element_text(size = 8))
+```
 
-# Heatmap
+```{r nn-lrp-heatmap, fig.width=9, fig.height=5, results='hide'}
 top10_features <- lrp_df$Feature[1:10]
 lrp_top10      <- lrp_scores[1:50, top10_features]
-
 lrp_heatmap_df <- as.data.frame(lrp_top10) %>%
   mutate(obs = 1:50) %>%
   pivot_longer(cols = -obs, names_to = "Feature", values_to = "Relevance")
 
 ggplot(lrp_heatmap_df, aes(x = Feature, y = factor(obs), fill = Relevance)) +
   geom_tile() +
-  scale_fill_gradient2(low = "steelblue", mid = "white", high = "#e74c3c",
-                       midpoint = 0) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "#e74c3c", midpoint = 0) +
   labs(title    = "Neural Network: LRP Relevance Heatmap",
        subtitle = "Top 10 features across 50 test observations",
        x = NULL, y = "Observation", fill = "Relevance") +
-  theme_minimal(base_size = 11) +
+  theme_minimal(base_size = 10) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1),
         axis.text.y = element_blank())
 ```
 
-The LRP analysis reveals which features the neural network relies on most when making predictions. `Suicidal_Thoughts` and `Family_History_Mental_Illness` are the two most relevant features, followed by `Financial_Stress`, `Loneliness`, and `Concentration_Difficulty`. `On_Medication` appears prominently at rank 6 — a feature that did not emerge as strongly in tree-based model importance plots, suggesting the neural network has identified a pattern specific to its learned representation.
+`Suicidal_Thoughts` and `Family_History_Mental_Illness` are the two most relevant features, followed by `Financial_Stress`, `Loneliness`, and `Concentration_Difficulty`. `On_Medication` appears prominently at rank 6 -- not as dominant in tree-based models, suggesting the neural network has identified a distinct pattern.
 
-Comparing LRP relevance with Random Forest variable importance reveals both consistency and divergence. Both methods agree that `Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness`, and `Social_Support` are important predictors. However, `Social_Support` ranked first in the Random Forest but seventh in LRP, while `Suicidal_Thoughts` — a binary indicator — is dominant in LRP but was not the top predictor in tree-based models. This divergence reflects the different mechanisms: Random Forest importance measures average accuracy gain across splits, while LRP measures the direct contribution of each feature to the final prediction score for each observation.
+Comparing LRP with Random Forest importance reveals both consistency and divergence. Both methods agree on `Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness`, and `Social_Support`. However, `Social_Support` ranked first in Random Forest but seventh in LRP, while `Suicidal_Thoughts` is dominant in LRP but not in tree-based models. The heatmap confirms heterogeneous feature usage across observations -- different combinations of risk factors drive predictions for different individuals, which is clinically realistic.
 
-The heatmap provides the local, observation-level view. Red cells indicate that a feature pushed the prediction towards "Yes" for that observation; blue cells indicate a push towards "No". The heterogeneity across rows confirms that the model does not rely on a fixed set of features for all observations — different combinations of risk factors drive the prediction for different individuals, which is clinically realistic and suggests the model has learned meaningful structure beyond a simple majority-class rule.
+---
 
+# **Model Comparison and Conclusion**
 
+```{r final-comparison-build}
+p_linear_val <- predict(svm_linear, newdata = val_sc_svm, type = "prob")[, "Yes"]
+p_radial_val <- predict(svm_radial, newdata = val_sc_svm, type = "prob")[, "Yes"]
 
+cm_linear <- confusionMatrix(
+  factor(ifelse(predict(svm_linear, newdata = test_sc_svm, type = "prob")[,"Yes"] >=
+                  pick_best_thr_bal(y_val_svm, p_linear_val)$best$threshold, "Yes","No"),
+         levels = c("No","Yes")), y_test_svm, positive = "Yes")
 
+cm_radial <- confusionMatrix(
+  factor(ifelse(predict(svm_radial, newdata = test_sc_svm, type = "prob")[,"Yes"] >=
+                  pick_best_thr_bal(y_val_svm, p_radial_val)$best$threshold, "Yes","No"),
+         levels = c("No","Yes")), y_test_svm, positive = "Yes")
 
+final_comparison <- bind_rows(
+  knn_summary, tree_summary, bag_summary, rf_summary,
+  data.frame(
+    Model = "SVM (Linear)",
+    Main_Setting = paste0("kernel=Linear | C=", svm_linear$bestTune$C),
+    Threshold = round(pick_best_thr_bal(y_val_svm, p_linear_val)$best$threshold, 2),
+    Test_AUC = round(as.numeric(auc(roc_linear_obj)), 3),
+    Balanced_Accuracy = round(0.5 * (as.numeric(cm_linear$byClass["Sensitivity"]) +
+                                     as.numeric(cm_linear$byClass["Specificity"])), 3),
+    Sensitivity = round(as.numeric(cm_linear$byClass["Sensitivity"]), 3),
+    Specificity = round(as.numeric(cm_linear$byClass["Specificity"]), 3)),
+  data.frame(
+    Model = "SVM (Radial)",
+    Main_Setting = paste0("kernel=Radial | C=", svm_radial$bestTune$C,
+                           " | sigma=", svm_radial$bestTune$sigma),
+    Threshold = round(pick_best_thr_bal(y_val_svm, p_radial_val)$best$threshold, 2),
+    Test_AUC = round(as.numeric(auc(roc_radial_obj)), 3),
+    Balanced_Accuracy = round(0.5 * (as.numeric(cm_radial$byClass["Sensitivity"]) +
+                                     as.numeric(cm_radial$byClass["Specificity"])), 3),
+    Sensitivity = round(as.numeric(cm_radial$byClass["Sensitivity"]), 3),
+    Specificity = round(as.numeric(cm_radial$byClass["Specificity"]), 3)),
+  data.frame(
+    Model = "SVM (Polynomial)",
+    Main_Setting = paste0("kernel=Polynomial | C=", svm_poly$bestTune$C,
+                           " | degree=", svm_poly$bestTune$degree),
+    Threshold = round(best_thr_svm, 2), Test_AUC = round(auc_svm, 3),
+    Balanced_Accuracy = round(bal_svm, 3), Sensitivity = round(sens_svm, 3),
+    Specificity = round(spec_svm, 3)),
+  nn_summary)
+```
 
-
-
-
-## **Model Comparison and Conclusion**
-```{r final-roc, echo=FALSE}
-roc_list_all <- list(
-  "k-NN"             = roc_knn,
-  "Decision Tree"    = roc_tree,
-  "Bagging"          = roc_bag,
-  "Random Forest"    = roc_rf,
-  "SVM (Linear)"     = roc_linear_obj,
-  "SVM (Radial)"     = roc_radial_obj,
-  "SVM (Polynomial)" = roc_poly_obj,
-  "Neural Network"   = roc_nn
-)
+```{r final-roc, fig.width=10, fig.height=5.5}
+roc_list_all <- list("k-NN" = roc_knn, "Decision Tree" = roc_tree,
+                     "Bagging" = roc_bag, "Random Forest" = roc_rf,
+                     "SVM (Linear)" = roc_linear_obj, "SVM (Radial)" = roc_radial_obj,
+                     "SVM (Polynomial)" = roc_poly_obj, "Neural Network" = roc_nn)
 
 auc_vals_all <- sapply(roc_list_all, function(r) as.numeric(auc(r)))
 auc_text_all <- paste0(names(auc_vals_all), ": AUC = ",
                        sprintf("%.3f", auc_vals_all), collapse = "\n")
 
 ggroc(roc_list_all, linewidth = 1) +
-  theme_minimal(base_size = 14) +
+  theme_minimal(base_size = 13) +
   geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
   scale_color_viridis_d(end = 0.9) +
   labs(title    = "Machine Learning Models: ROC Curves (Test Set)",
        subtitle = "All models evaluated on the same held-out test set",
        color    = "Model") +
   theme(legend.position = "right") +
-  annotate("text", x = 0.45, y = 0.05,
-           label = auc_text_all, hjust = 0, vjust = 0, size = 3.5)
-
-print(final_comparison %>% arrange(desc(Test_AUC)))
+  annotate("text", x = 0.45, y = 0.05, label = auc_text_all,
+           hjust = 0, vjust = 0, size = 3.2)
 ```
 
+## Summary of Results
 
+All eight models were evaluated on the same held-out test set, reflecting the true class distribution.
 
+```{r final-table}
+knitr::kable(final_comparison %>% arrange(desc(Test_AUC)) %>%
+               select(Model, Test_AUC, Balanced_Accuracy, Sensitivity, Specificity, Threshold),
+             digits = 3, caption = "Model Comparison: Test Set Performance")
+```
 
-
-
-
-### Summary of Results
-
-All eight models were evaluated on the same held-out test set, which reflects the true class distribution of the original data. The table below summarises the key performance metrics.
-
-| Model | Test AUC | Balanced Acc | Sensitivity | Specificity | Threshold |
-|---|---|---|---|---|---|
-| SVM (Linear) | **0.636** | 0.596 | 0.609 | 0.583 | 0.48 |
-| Random Forest | 0.629 | 0.597 | 0.681 | 0.513 | 0.68 |
-| Neural Network | 0.623 | **0.604** | 0.676 | 0.532 | 0.45 |
-| Bagging | 0.615 | 0.567 | 0.556 | 0.577 | 0.73 |
-| SVM (Polynomial) | 0.599 | 0.579 | 0.664 | 0.494 | 0.93 |
-| SVM (Radial) | 0.596 | 0.539 | 0.956 | 0.122 | 0.95 |
-| Decision Tree | 0.586 | 0.581 | 0.533 | 0.628 | 0.81 |
-| k-NN | 0.545 | 0.537 | 0.594 | 0.481 | 0.50 |
-
-### Key Findings
+## Key Findings
 
 **1. SVM Linear kernel is the best overall model.** With a test AUC of 0.636, it achieves the highest discriminative performance and a well-balanced Sensitivity (0.609) / Specificity (0.583) tradeoff. Its threshold of 0.48 is close to 0.50, suggesting good probability calibration. The linear kernel's simplicity acts as implicit regularisation that prevents the overfitting to SMOTE-balanced training folds observed in more complex kernels.
 
-**2. Non-linear SVM kernels severely overfit to SMOTE.** Radial and Polynomial kernels achieve CV AUC of 0.971 and 0.983 respectively, but collapse to 0.596 and 0.599 on the test set — a gap of over 0.38. The Radial kernel's extreme imbalance (Sensitivity=0.956, Specificity=0.122) confirms that it has learned to predict "Yes" for almost everything, exploiting the artificial balance created by SMOTE rather than learning genuine discriminative patterns. This is the most striking illustration of the CV-to-test gap problem in this analysis.
+**2. Non-linear SVM kernels severely overfit to SMOTE.** Radial and Polynomial kernels achieve CV AUC of 0.971 and 0.983 respectively, but collapse to 0.596 and 0.599 on the test set -- a gap of over 0.38. The Radial kernel's extreme imbalance (Sensitivity=0.956, Specificity=0.122) confirms that it has learned to predict "Yes" for almost everything, exploiting the artificial balance created by SMOTE rather than learning genuine discriminative patterns.
 
-**3. Ensemble methods outperform single trees.** The progression Decision Tree (0.586) → Bagging (0.615) → Random Forest (0.629) cleanly demonstrates the ensemble learning principle. Each step reduces variance through greater tree diversity: Bagging via averaging, Random Forest via additional predictor subsampling (`mtry=5`). The pruned decision tree with 40 leaves is the most interpretable model, relying on `Social_Support` and `Family_History_Mental_Illness` as primary splits — clinically credible and communicable rules.
+**3. Ensemble methods outperform single trees.** The progression Decision Tree (0.586) → Bagging (0.615) → Random Forest (0.629) cleanly demonstrates the ensemble learning principle. Each step reduces variance through greater tree diversity: Bagging via averaging, Random Forest via additional predictor subsampling (`mtry=5`). The pruned decision tree with 40 leaves is the most interpretable model, relying on `Social_Support` and `Family_History_Mental_Illness` as primary splits.
 
-**4. Neural Network is competitive and best-calibrated.** The neural network achieves AUC 0.623 and the highest Balanced Accuracy (0.604). Its threshold of 0.45 is the closest to 0.50 among all models, reflecting that binary cross-entropy loss directly optimises probability calibration. The training curves confirm clean learning behaviour with effective early stopping and dropout regularisation.
+**4. Neural Network is competitive and best-calibrated.** The neural network achieves AUC 0.623 and the highest Balanced Accuracy (0.604). Its threshold of 0.45 is the closest to 0.50 among all models, reflecting that binary cross-entropy loss directly optimises probability calibration.
 
-**5. k-NN performs worst.** Euclidean distance on Likert-scale ordinal predictors is not meaningful, and SMOTE's interpolation of integer-valued variables produces non-integer synthetic observations that further distort the distance space. k-NN is fundamentally unsuited to this dataset.
+**5. k-NN performs worst.** Euclidean distance on Likert-scale ordinal predictors is not meaningful, and SMOTE's interpolation produces non-integer synthetic observations that further distort the distance space.
 
-### General Observations
+## General Observations
 
-**All models perform in a narrow AUC range (0.545–0.636).** No single model dominates clearly — the top four models (SVM Linear, Random Forest, Neural Network, Bagging) are separated by only 0.021 AUC points. This suggests that the performance ceiling is largely determined by the dataset itself rather than the choice of model. The features are predominantly Likert-scale self-reported measures with substantial overlap between classes, making clean separation inherently difficult.
+**All models perform in a narrow AUC range (0.545-0.636).** The top four models are separated by only 0.021 AUC points. The performance ceiling is largely determined by the dataset itself -- predominantly Likert-scale self-reported measures with substantial class overlap.
 
-**CV-to-test gap is present across all models, but varies by complexity.** Simple models (SVM Linear, Neural Network, Decision Tree) show small gaps between CV and test performance. Complex non-linear models (SVM Radial, SVM Polynomial) show gaps exceeding 0.37 AUC points. This pattern is consistent with overfitting to the SMOTE-balanced training distribution — the more flexible the model, the more it exploits the artificial class balance rather than learning generalisable patterns.
+**CV-to-test gap varies by complexity.** Simple models (SVM Linear, Neural Network, Decision Tree) show small gaps. Complex non-linear models (SVM Radial, SVM Polynomial) show gaps exceeding 0.37 AUC points -- consistent with overfitting to SMOTE-balanced training.
 
-**The majority class drives threshold selection.** Since Yes is the dominant class, all models tend to assign high "Yes" probabilities to most observations. This pushes optimal thresholds above 0.50 for most models — ranging from 0.68 (Random Forest) to 0.95 (SVM Radial). The two models with thresholds closest to 0.50 — Neural Network (0.45) and SVM Linear (0.48) — are also the two best-calibrated models, and notably the ones least affected by the CV-to-test gap.
+**The majority class drives threshold selection.** Since Yes is the dominant class, all models tend to assign high "Yes" probabilities, pushing optimal thresholds above 0.50 -- ranging from 0.68 (Random Forest) to 0.95 (SVM Radial). The two models with thresholds closest to 0.50 -- Neural Network (0.45) and SVM Linear (0.48) -- are also the best-calibrated.
 
-**Feature importance is broadly consistent across model families, with notable divergences.**
-Across the decision tree, bagging, and random forest variable importance plots, `Social_Support` 
-appears as the dominant feature, with `Family_History_Mental_Illness`, `Mood_Swings`, and 
-`Feeling_Worthless` also ranking highly. The LRP analysis of the neural network largely confirms 
-this picture — `Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness`, and 
-`Social_Support` are important across both tree-based and neural network approaches. However, 
-LRP assigns the highest relevance to `Suicidal_Thoughts` and elevates `On_Medication` to rank 6, 
-neither of which dominated the tree-based importance rankings. This divergence reflects the 
-different mechanisms: Random Forest importance captures average accuracy gain across splits at 
-a global level, while LRP measures each feature's direct contribution to individual predictions. 
-The convergence across methods on social and psychological support factors — `Social_Support`, 
-`Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness` — provides the strongest 
-evidence that these are the genuinely informative signals in this dataset.
-
-
-
+**Feature importance is broadly consistent across model families, with notable divergences.** `Social_Support` is dominant in tree-based models, while LRP assigns highest relevance to `Suicidal_Thoughts` in the neural network. The convergence on `Family_History_Mental_Illness`, `Financial_Stress`, `Loneliness`, and `Social_Support` across all methods provides the strongest evidence that these are the genuinely informative signals in this dataset.
